@@ -1,0 +1,127 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>incompetech catalog</title>
+<meta name="description" content="A filterable database over Kevin MacLeod's royalty-free music catalogue.">
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+<header class="bar">
+  <h1>incompetech catalog</h1>
+  <p class="sub">
+    Kevin MacLeod's catalogue, filterable on the axes
+    <a href="https://incompetech.com/music/royalty-free/music.html">his own page</a>
+    does not offer: tempo, duration, collection, category, upload date.
+  </p>
+</header>
+
+<!-- Shown instead of the filters when no database has been built yet. The app
+     answers before the first build on purpose, so the page has to say so. -->
+<section id="nodb" hidden>
+  <h2>No catalogue database yet</h2>
+  <p>The app is up; nothing has been ingested. On the droplet:</p>
+  <pre><code>incompetech build</code></pre>
+  <p>or, in a checkout: <code>.venv/bin/python -m incompetech build</code></p>
+</section>
+
+<main id="app" hidden>
+
+<form id="filters" autocomplete="off">
+  <div class="row">
+    <label class="grow">
+      <span>Search title and description</span>
+      <input type="search" id="text" placeholder="dark forest">
+    </label>
+    <label>
+      <span>Sort</span>
+      <select id="sort"></select>
+    </label>
+    <label class="check">
+      <input type="checkbox" id="desc"> <span>Descending</span>
+    </label>
+  </div>
+
+  <fieldset class="feels">
+    <legend>
+      Feel
+      <span class="mode" role="group" aria-label="How the chosen feels combine">
+        <button type="button" id="feelmode" aria-pressed="true"
+                title="ALL: a piece must carry every chosen feel. ANY: one of them is enough.">ALL</button>
+      </span>
+      <button type="button" id="clearfeels" class="linkish">clear</button>
+    </legend>
+    <div id="feelchips" class="chips"></div>
+  </fieldset>
+
+  <div class="row">
+    <label><span>Genre</span><select id="genre"></select></label>
+    <label><span>Category</span><select id="category"></select></label>
+    <label><span>Collection</span><select id="collection"></select></label>
+    <label><span>Instrument</span><select id="instrument"></select></label>
+  </div>
+
+  <div class="row">
+    <label class="narrow"><span>BPM from</span><input type="number" id="bpm_min" min="0" max="400"></label>
+    <label class="narrow"><span>to</span><input type="number" id="bpm_max" min="0" max="400"></label>
+    <label class="check">
+      <input type="checkbox" id="bpm_unknown"> <span>Tempo unknown</span>
+    </label>
+    <label class="narrow"><span>Length from</span><input type="text" id="min_length" placeholder="3:00"></label>
+    <label class="narrow"><span>to</span><input type="text" id="max_length" placeholder="6:00"></label>
+    <label class="narrow"><span>Uploaded after</span><input type="text" id="since" placeholder="2019-01-01"></label>
+    <label class="narrow"><span>before</span><input type="text" id="until" placeholder="2026-01-01"></label>
+    <button type="button" id="reset" class="linkish">reset all</button>
+  </div>
+</form>
+
+<p id="error" class="error" hidden></p>
+
+<div class="results-head">
+  <p id="count" aria-live="polite">…</p>
+  <p id="playing" class="playing"></p>
+</div>
+
+<table id="results">
+  <thead>
+    <tr>
+      <th class="play"><span class="sr">Preview</span></th>
+      <th>Title</th>
+      <th class="num">Length</th>
+      <th class="num">BPM</th>
+      <th>Genre</th>
+      <th>Collection</th>
+      <th>Feels</th>
+    </tr>
+  </thead>
+  <tbody id="rows"></tbody>
+</table>
+
+<nav class="pager">
+  <button type="button" id="prev">← previous</button>
+  <span id="page"></span>
+  <button type="button" id="next">next →</button>
+</nav>
+
+</main>
+
+<footer>
+  <!-- A licence condition, not decoration: every piece here is CC BY 4.0, and
+       the credit has to be legible wherever the audio plays. It is in the
+       markup rather than rendered by script so it is on the page even if the
+       API never answers. -->
+  <p class="credit">Music by Kevin MacLeod (incompetech.com), licensed under
+    Creative Commons: By Attribution 4.0</p>
+  <p class="meta">
+    <a href="https://creativecommons.org/licenses/by/4.0/">CC BY 4.0</a> ·
+    previews stream from incompetech.com, nothing is rehosted here ·
+    <span id="built"></span>
+  </p>
+</footer>
+
+<audio id="player" preload="none"></audio>
+<script src="/static/app.js"></script>
+</body>
+</html>
