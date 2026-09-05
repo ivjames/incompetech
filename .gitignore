@@ -1,0 +1,25 @@
+# python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# The catalogue database. Derived: one command rebuilds it from incompetech's
+# own pieces.json, so a copy in git would only go stale and churn in every
+# diff. data/ is where it lives, and — like .env — it survives a deploy's hard
+# reset precisely because it is not tracked.
+/data/
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+
+# logs / local
+*.log
+.env
+.DS_Store
