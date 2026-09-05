@@ -17,30 +17,25 @@ about this site rather than about the platform. For the box itself, read the
 
 - The checkout dir is **`/var/www/incompetech`** (always `/var/www/<stub>` on
   this box).
-- The port is **8072 — provisional.** It is the next free one by lab980's
-  registry: 8069 is the highest entry there, 8070 is ffc's centeredge-mock
-  upstream (prose-only in lab980's `CLAUDE.md`, not a registry entry) and 8071
-  is dnd-sim. But nothing in this repo can reach the droplet, and a port is a
-  fact about the box rather than about a file, so **confirm it there before the
-  first `incompetech setup`**:
-  `grep -rho 'proxy_pass http://127.0.0.1:[0-9]*' /etc/nginx/sites-enabled/ | sort -u`.
-  **Moving it on the box is `.env` and the vhost, and nothing else.** `run.sh`
-  sources `.env` after pm2 has applied `ecosystem.config.js`, so `.env`'s
-  `PORT` already wins, and `bin/incompetech` resolves the port the same way
-  (`INCOMPETECH_PORT`, then `.env`, then its default). The port in
-  `ecosystem.config.js` and the fallback in `bin/incompetech` are repo
-  defaults: change them in a commit, never on the droplet, because both files
-  are tracked and `deploy` hard-resets the checkout — an edit there is undone
-  silently on the next deploy.
+- The port is **8072**, confirmed on the droplet and live at
+  https://incompetech.lab980.com since 2026-09-05. It was the next free one by
+  lab980's registry when this was open: 8069 is the highest entry there, 8070
+  is ffc's centeredge-mock upstream (prose-only in lab980's `CLAUDE.md`, not a
+  registry entry) and 8071 is dnd-sim. **Moving it, if it ever has to move, is
+  `.env` and the vhost, and nothing else.** `run.sh` sources `.env` after pm2
+  has applied `ecosystem.config.js`, so `.env`'s `PORT` already wins, and
+  `bin/incompetech` resolves the port the same way (`INCOMPETECH_PORT`, then
+  `.env`, then its default). The port in `ecosystem.config.js` and the
+  fallback in `bin/incompetech` are repo defaults: change them in a commit,
+  never on the droplet, because both files are tracked and `deploy`
+  hard-resets the checkout — an edit there is undone silently on the next
+  deploy.
 - **The site is registered in `lab980.com`** — `.claude/sites.json` and the
   prose site list both carry it (PR #53), as shape `app`, dir
-  `/var/www/incompetech`, cli `bin/incompetech`. Its `port` is recorded as
-  `null` with `"port"` in `unverified`, because that registry's invariant is
-  that `unverified` lists the fields left null rather than the ones somebody
-  guessed; the provisional 8072 is in its `notes`. **Filling that port in, once
-  the droplet confirms it, is the remaining step** — and it is a change in that
-  repo, not this one. `health-check --site incompetech` will know the site as
-  soon as there is a vhost for it to probe.
+  `/var/www/incompetech`, cli `bin/incompetech`, port **8072**. That port was
+  filled in once the droplet confirmed it (a separate PR in that repo), so the
+  registry entry no longer carries `"port"` in `unverified`.
+  `health-check --site incompetech` knows the site and probes its vhost.
 - **There are no platform keys and no secrets.** No API key, no credential, no
   write path: every route is a GET, and the one outbound request in the repo
   is the build fetching a public JSON document. So `bin/incompetech` carries
