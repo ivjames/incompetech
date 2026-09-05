@@ -82,6 +82,68 @@
   </div>
 </form>
 
+<!-- Playlists live in this browser's localStorage, not on the server: this
+     site has no login and no write path, and a playlist on a public server
+     with neither is one anybody can delete. Export/Import is how one leaves
+     the browser it was made in. -->
+<section id="playlists" class="playlists" hidden>
+  <div class="row plbar">
+    <label>
+      <span>Playlist</span>
+      <select id="pl_select"></select>
+    </label>
+    <button type="button" id="pl_new">New</button>
+    <button type="button" id="pl_rename">Rename</button>
+    <button type="button" id="pl_dup">Duplicate</button>
+    <button type="button" id="pl_delete">Delete</button>
+    <button type="button" id="pl_import">Import…</button>
+    <input type="file" id="pl_file" accept="application/json,.json" hidden>
+    <button type="button" id="pl_toggle" aria-expanded="false"
+            aria-controls="pl_panel">Show</button>
+    <span id="pl_summary" class="plsum" aria-live="polite"></span>
+  </div>
+
+  <p id="pl_trouble" class="error" hidden></p>
+
+  <div id="pl_panel" hidden>
+    <p id="pl_empty" class="muted">
+      Nothing in this playlist yet — press <b>+</b> beside any result below.
+    </p>
+
+    <table id="pl_table" hidden>
+      <thead>
+        <tr>
+          <th class="ord"><span class="sr">Reorder</span></th>
+          <th>Title</th>
+          <th class="num">Length</th>
+          <th class="num">BPM</th>
+          <th>Genre</th>
+          <th class="play"><span class="sr">Remove</span></th>
+        </tr>
+      </thead>
+      <tbody id="pl_rows"></tbody>
+    </table>
+
+    <p id="pl_total" class="muted" aria-live="polite"></p>
+
+    <div class="row plexport">
+      <button type="button" id="pl_copy">Copy credits</button>
+      <button type="button" id="pl_credits">credits .txt</button>
+      <button type="button" id="pl_m3u">.m3u</button>
+      <button type="button" id="pl_urls">urls .txt</button>
+      <button type="button" id="pl_json">.json</button>
+      <span id="pl_note" class="muted" aria-live="polite"></span>
+    </div>
+
+    <p class="muted small">
+      Every credit line above is the one the catalogue itself publishes for
+      that piece, re-read on load rather than kept in a copy. The .m3u and the
+      URL list point at incompetech.com's own files — nothing is rehosted and
+      nothing is downloaded by this page.
+    </p>
+  </div>
+</section>
+
 <div class="results-head">
   <p id="count" aria-live="polite">…</p>
   <p id="playing" class="playing"></p>
@@ -91,12 +153,13 @@
   <thead>
     <tr>
       <th class="play"><span class="sr">Preview</span></th>
+      <th class="add"><span class="sr">Add to playlist</span></th>
       <th>Title</th>
       <th class="num">Length</th>
       <th class="num">BPM</th>
       <th>Genre</th>
       <th>Collection</th>
-      <th>Feels</th>
+      <th class="feels">Feels</th>
     </tr>
   </thead>
   <tbody id="rows"></tbody>
@@ -125,6 +188,7 @@
 </footer>
 
 <audio id="player" preload="none"></audio>
+<script src="/static/playlists.js"></script>
 <script src="/static/app.js"></script>
 </body>
 </html>

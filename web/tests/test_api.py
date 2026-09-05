@@ -266,3 +266,43 @@ def test_json_is_never_cached(client):
 def test_an_unknown_route_is_json_not_html(client):
     code, doc = get(client, "/api/nope")
     assert code == 404 and doc == {"error": "not found"}
+
+
+def test_a_saved_list_resolves_by_name_with_a_current_credit(client):
+    """How a playlist held in a browser gets its rows back.
+
+    The page stores filenames and nothing else, so this is the only route by
+    which a playlist becomes a credit block or a download list — and what it
+    hands back has to be the catalogue's own current sentence, not whatever
+    was true when the piece was added.
+    """
+    qs = "filename=Corncob.mp3&filename=Dungeon+Descent.mp3"
+    code, doc = get(client, "/api/pieces?" + qs)
+    assert code == 200
+    assert doc["total"] == 2
+    for p in doc["pieces"]:
+        assert p["credit"] == I.credit_line(p["title"])
+        assert p["mp3_url"].startswith(I.MP3_BASE)
+    # A name the catalogue no longer has is simply absent, not an error: the
+    # page notices the gap itself and says which piece it could not resolve.
+    code, doc = get(client, "/api/pieces?filename=Corncob.mp3&filename=gone.mp3")
+    assert code == 200
+    assert [p["filename"] for p in doc["pieces"]] == ["Corncob.mp3"]
+
+
+def test_too_many_filenames_is_a_400_and_not_a_414_from_the_proxy(client):
+    """The bound exists so the app answers instead of nginx.
+
+    Past the proxy's request-line buffer the page gets an HTML 414 it cannot
+    read and cannot explain. Refused here, it is told to ask in batches — and
+    the number it is told is the number the page batches by.
+    """
+    from web.api import MAX_FILENAMES
+    ok = "&".join(f"filename=x{i}.mp3" for i in range(MAX_FILENAMES))
+    code, _doc = get(client, "/api/pieces?" + ok)
+    assert code == 200
+    code, doc = get(client, "/api/pieces?" + ok + "&filename=one-too-many.mp3")
+    assert code == 400
+    assert str(MAX_FILENAMES) in doc["error"]
+    # Respelled as the parameter the caller sent, like every other refusal.
+    assert "--" not in doc["error"]

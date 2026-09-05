@@ -38,7 +38,14 @@ about this site rather than about the platform. For the box itself, read the
   `health-check --site incompetech` knows the site and probes its vhost.
 - **There are no platform keys and no secrets.** No API key, no credential, no
   write path: every route is a GET, and the one outbound request in the repo
-  is the build fetching a public JSON document. So `bin/incompetech` carries
+  is the build fetching a public JSON document. **Playlists did not change
+  this, on purpose** — they are the first thing anyone has wanted the site to
+  *keep*, and the two ways to keep them on the server were to let the whole
+  internet delete each other's, or to grow the login this app has so far not
+  needed. So they are held in the browser's `localStorage` and the server
+  stayed read-only. That is a trade, not a free win: `bin/incompetech` cannot
+  see a playlist, so it is the one feature the CLI and the page do not share,
+  and a playlist leaves its browser only through Export/Import. So `bin/incompetech` carries
   none of dnd-sim's key machinery — no key-store adoption, no write token
   (and since 2026-09-05 there is no box-level key store to adopt from anyway:
   an app's `.env` is the only copy of any key it uses). `.env` holds three
@@ -221,9 +228,48 @@ in the process. What each step does and how to confirm what is live:
   kitchen-sink `.gitignore` eating a source dir is the classic thing this
   catches — `*.sqlite3` and `/data/` are ignored here on purpose, and
   `git ls-files web/static` confirms the page itself is tracked.
-- **The front end is three files and no framework.** `web/static/index.html`,
-  `app.js`, `style.css` — no CDN, no bundler, no build step, and every option
-  in every control comes from `/api/facets` rather than being written into the
-  JS. Light and dark are one set of custom properties redefined once under
-  `prefers-color-scheme`.
+- **The front end is four files and no framework.** `web/static/index.html`,
+  `app.js`, `playlists.js`, `style.css` — no CDN, no bundler, no build step,
+  and every option in every control comes from `/api/facets` rather than being
+  written into the JS. Light and dark are one set of custom properties
+  redefined once under `prefers-color-scheme`.
+- **`playlists.js` is in two halves, and the seam is the point.** The store —
+  the document, CRUD, resolve, the four export renderers — touches no DOM and
+  is the half a signed-in backend would replace; the panel below it does
+  nothing but render. The stored document is already shaped for that day:
+  generated ids rather than array positions (so two browsers' playlists merge
+  under one account without renumbering), per-record timestamps, and items
+  holding catalogue *keys* rather than catalogue rows. `active` — which
+  playlist this browser is looking at — is the one field the portable form
+  drops. The key is versioned in its name (`incompetech.playlists.v1`): a new
+  schema gets a new key, never a migration guessing what an old document meant.
+- **A playlist stores filenames, and the credit is re-read, never cached.**
+  `filename` is the catalogue's only unique field, so it is what an item holds
+  (plus a title, only so there is something to show before the network
+  answers). Everything a credit or a download needs comes back from
+  `/api/pieces?filename=…` when the panel opens. A credit assembled from a
+  stale snapshot is a licence statement about music made from a copy of the
+  facts, and getting that line right is the entire point of the feature — so
+  the sentence in an export is always the row's own `credit`, never one
+  rebuilt in JavaScript, and a piece that no longer resolves is **named in the
+  export rather than dropped**: a credit block one line short is wrong in the
+  direction nobody notices.
+- **`filename` is a filter, not a playlist endpoint.** Resolving a saved list
+  is `Filters.filenames` — exact, ORed — so the CLI got `--filename` for free
+  and the page's resolve goes through the same `search` as everything else.
+  Exact and not a LIKE on purpose: a name that matched loosely would put the
+  wrong piece's attribution under someone's video. The API caps it at
+  `MAX_FILENAMES` (200) and the page batches by 100, because past nginx's
+  request-line buffer the reply is a 414 of nginx's HTML that this app never
+  sees and the page cannot read; a test pins the two numbers together.
+- **localStorage throws — it does not return null** — in a browser set to
+  block site data, so every access in `playlists.js` is inside a guard and the
+  panel says why it cannot save rather than taking `boot` down with it over a
+  feature the catalogue works fine without.
+- **There is no JS test runner and there should not be one.** This site has no
+  Node, no `package.json` and no build step, and a test needing one would stop
+  a clean clone passing on the droplet. `web/tests/test_playlists.py` asserts
+  structure and coupling instead — that the credit is not rebuilt in JS, that
+  the batch size still fits the server's bound, that a typed name reaches the
+  DOM as text, that storage is only touched inside a guard.
 - pm2 process name is `incompetech`; `incompetech logs` tails it.
