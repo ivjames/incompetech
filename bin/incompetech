@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/usr/bin/env bash
 # incompetech — operate CLI for incompetech.lab980.com (incompetech catalog).
 #
 # A proxied app site: nginx fronts a pm2-managed Python/Flask process on
@@ -9,8 +9,8 @@
 # bring-up and every deploy, idempotently.
 #
 #   incompetech deploy     sync to origin/main, venv + pip, .env, vhost if
-#                          missing (-> setup), pm2 start/restart, build the
-#                          database if there isn't one, probe
+#                          missing (-> setup), pm2 start/restart, probe, save,
+#                          build the database if there isn't one
 #   incompetech setup      box-outward half, once: provision-site (DNS, vhost,
 #                          TLS) or the HTTP-only fallback vhost; pm2 boot hook
 #   incompetech build      rebuild the catalogue database from incompetech.com
@@ -20,12 +20,19 @@
 #
 # THIS SITE HOLDS NO SECRETS. There is no API key, no credential and no write
 # path: the app reads one SQLite file built from a public JSON document and
-# answers GETs. So there is deliberately nothing here resembling dndsim's key
-# machinery — no adoption from /etc/environment, no `env -u` launch, no write
-# token. `.env` carries three settings (PORT, HOST, INCOMPETECH_DB), none of
-# them sensitive, and it is still mode 600 and gitignored because a runtime
-# config file is untracked state either way. If this app ever does need a
-# secret, that is a decision to record in CLAUDE.md, not a line to slip in.
+# answers GETs. So there is nothing here resembling dndsim's key machinery —
+# no adoption from a key store, no write token. `.env` carries three settings
+# (PORT, HOST, INCOMPETECH_DB), none of them sensitive, and it is still mode
+# 600 and gitignored because a runtime config file is untracked state either
+# way. If this app ever does need a secret, that is a decision to record in
+# CLAUDE.md, not a line to slip in — and `.env` is where it would live: the
+# only copy, sourced by run.sh, never on pm2's argv or in its dump.
+#
+# pm2 is nonetheless launched the box's way — every pm2 call goes through
+# pm2_clean below, `env -i` plus an allowlist — because pm2 copies the
+# calling shell's environment into the process and into ~/.pm2/dump.pm2 on
+# save, whatever that shell happened to hold. That is a platform rule (the
+# lab980 template), not a property of this app.
 #
 # The database is the other piece of untracked state. It is DERIVED — one
 # command rebuilds it from https://incompetech.com/music/royalty-free/pieces.json
@@ -34,19 +41,26 @@
 # refreshes it deliberately, which is what you run when Kevin MacLeod has
 # published something new.
 #
-# POSIX sh on purpose: no arrays, no bashisms, so `sh -n bin/incompetech`
-# passes anywhere and the script runs under dash as well as bash.
+# Env overrides:
+#   INCOMPETECH_FQDN          default incompetech.lab980.com
+#   INCOMPETECH_BRANCH        default main
+#   INCOMPETECH_PORT          default: PORT in .env, else 8072 (see port())
+#   INCOMPETECH_ENV_FILE      default <app dir>/.env
+#   INCOMPETECH_PROBE_TRIES   default 10 (one second apart)
 #
 # The app dir is wherever this script's checkout lives (normally
 # /var/www/incompetech) — derived from the script's own path, so the
-# /usr/local/bin symlink resolves back here.
-set -eu
+# /usr/local/bin symlink resolves back here. Sourcing this file (bash tests,
+# INCOMPETECH_SOURCE_ONLY=1) defines the functions and stops before the
+# dispatch; BASH_SOURCE rather than $0 so the dir is right then too.
+set -euo pipefail
 
-SELF="$(readlink -f "$0")"
+SELF="$(readlink -f "${BASH_SOURCE[0]}")"
 ROOT="$(cd "$(dirname "$SELF")/.." && pwd)"
 FQDN="${INCOMPETECH_FQDN:-incompetech.lab980.com}"
 BRANCH="${INCOMPETECH_BRANCH:-main}"
 PORT_FALLBACK=8072              # resolved through port(); see there
+PROBE_TRIES="${INCOMPETECH_PROBE_TRIES:-10}"
 ENV_FILE="${INCOMPETECH_ENV_FILE:-$ROOT/.env}"
 REPO="ivjames/incompetech"
 STUB="incompetech"
@@ -58,8 +72,14 @@ DB_DEFAULT="$ROOT/data/catalog.sqlite3"
 NGINX_AVAIL="${NGINX_AVAIL:-/etc/nginx/sites-available}"
 NGINX_ENABLED="${NGINX_ENABLED:-/etc/nginx/sites-enabled}"
 
-c_blue=$(printf '\033[1;34m'); c_yellow=$(printf '\033[1;33m')
-c_red=$(printf '\033[1;31m');  c_off=$(printf '\033[0m')
+# The `pm2 start` argv that registers this app the FIRST time. Every later
+# deploy is a restart of that registration, but on a fresh box (or after
+# `pm2 delete`) nothing is registered and restart fails. The ecosystem file
+# names the process "$APP"; --only picks it out. The process gets PORT from
+# pm2_clean below and everything else from .env, through run.sh.
+START_CMD=("$ECOSYSTEM" --only "$APP")
+
+c_blue=$'\033[1;34m'; c_yellow=$'\033[1;33m'; c_red=$'\033[1;31m'; c_off=$'\033[0m'
 log()  { printf '%s==>%s %s\n' "$c_blue" "$c_off" "$*"; }
 warn() { printf '%swarn:%s %s\n' "$c_yellow" "$c_off" "$*" >&2; }
 die()  { printf '%serror:%s %s\n' "$c_red" "$c_off" "$*" >&2; exit 1; }
@@ -72,9 +92,12 @@ pm2 process incompetech).
 Usage:
   incompetech deploy [--no-install] [--rebuild]
                           sync to origin/main, venv + pip, .env, vhost if
-                          missing (runs setup), pm2 start/restart, probe.
-                          Builds the catalogue database only when there is
-                          none; --rebuild refreshes it from incompetech.com
+                          missing (runs setup), pm2 start/restart under a
+                          scrubbed environment (env -i), probe, pm2 save when
+                          every process is online. Exit 1 unless
+                          127.0.0.1:<port>/api/health answers 200. Builds the
+                          catalogue database only when there is none;
+                          --rebuild refreshes it from incompetech.com
   incompetech setup [--dry-run]
                           once per box, idempotent: DNS + vhost + TLS via
                           provision-site, or the HTTP-only fallback vhost from
@@ -82,10 +105,11 @@ Usage:
   incompetech build [--from-file F]
                           rebuild the catalogue database (two requests, ~1 MB,
                           no key). Atomic: the running app keeps answering
-  incompetech restart      pm2 restart + probe (re-reads .env)
+  incompetech restart      pm2 restart + probe (re-reads .env); exit 1 unless
+                           the local /api/health answers 200
   incompetech status       HEAD, pm2, .env, database, upstream, vhost, probes,
                            cert days
-  incompetech logs [-n N]  tail pm2 logs
+  incompetech logs [-n N]  tail pm2 logs (arguments go to `pm2 logs`)
 
 First time on the droplet (as root), the whole bring-up is:
   git clone https://github.com/ivjames/incompetech /var/www/incompetech
@@ -95,34 +119,54 @@ First time on the droplet (as root), the whole bring-up is:
 No keys, no secrets, no hand steps: this app reads a public JSON document and
 serves a database built from it.
 
+pm2 never sees the calling shell. Every pm2 command runs under `env -i` with
+only PATH, HOME, PM2_HOME and TERM (when set), LANG and PORT; the process gets
+the environment of the command that started it and ~/.pm2/dump.pm2 records
+that. The app reads .env through run.sh instead.
+
 Env: INCOMPETECH_FQDN, INCOMPETECH_BRANCH (default main),
-     INCOMPETECH_PORT (default 8072), INCOMPETECH_ENV_FILE (default ./.env).
+     INCOMPETECH_PORT (default: PORT in .env, else 8072),
+     INCOMPETECH_ENV_FILE (default ./.env),
+     INCOMPETECH_PROBE_TRIES (default 10; seconds deploy/restart wait for a 200).
 USAGE
 }
 
-need_root() { [ "$(id -u)" -eq 0 ] || die "run as root."; }
+# The app runs as root under pm2, and pm2 keeps one daemon, process list and
+# dump PER HOME — root's is /root/.pm2. Run as anyone else, or as uid 0 with
+# someone else's HOME (`su root` without `-`, `sudo` preserving HOME), and
+# every pm2 call here talks to a different daemon: `status` says "not
+# registered" while the site is up, and `deploy` starts a second copy.
+need_root() {
+  [ "$(id -u)" -eq 0 ] || die "$1 must run as root (the app's pm2 daemon is root's)."
+  local rhome; rhome="$(getent passwd root | cut -d: -f6)"
+  [ -n "${PM2_HOME:-}" ] || [ "${HOME:-}" = "$rhome" ] \
+    || die "$1: HOME is '${HOME:-}' but root's home is $rhome — pm2 keys its daemon and dump off HOME, so this would talk to a different pm2. Use \`sudo -i\` or \`su -\` (or set PM2_HOME on purpose)."
+}
 
 # ---------------------------------------------------------------------------
 # .env. Three settings, none of them a secret, seeded once and never
-# overwritten — an operator who changed one on the box meant it.
+# overwritten — an operator who changed one on the box meant it. Names only
+# ever appear in output: today's seeds are not secrets, but a log line that
+# prints values is one seed away from printing one.
 # ---------------------------------------------------------------------------
 env_file_get() {  # $1=file $2=KEY -> value on stdout ('' if absent)
-  file="$1"; key="$2"; val=""; found=0
+  local file="$1" key="$2" line val found=0
   [ -r "$file" ] || return 0
   while IFS= read -r line || [ -n "$line" ]; do
-    line="${line%$(printf '\r')}"
-    line="${line#"${line%%[![:space:]]*}"}"
+    line="${line%$'\r'}"
+    line="${line#"${line%%[![:space:]]*}"}"                 # ltrim
     case "$line" in ''|'#'*) continue;; esac
-    case "$line" in export[[:space:]]*) line="${line#export}"
-      line="${line#"${line%%[![:space:]]*}"}";; esac
+    case "$line" in
+      export[[:space:]]*) line="${line#export}"; line="${line#"${line%%[![:space:]]*}"}";;
+    esac
     case "$line" in "$key="*) ;; *) continue;; esac
     val="${line#*=}"
     case "$val" in
-      \"*\") val="${val#\"}"; val="${val%\"}";;
-      \'*\') val="${val#\'}"; val="${val%\'}";;
-      *)     val="${val%"${val##*[![:space:]]}"}";;
+      \"*\") val="${val#\"}"; val="${val%\"}";;              # "quoted"
+      \'*\') val="${val#\'}"; val="${val%\'}";;              # 'quoted'
+      *)     val="${val%"${val##*[![:space:]]}"}";;          # bare: rtrim
     esac
-    found=1                                     # last one wins, like a shell
+    found=1                                                  # last one wins, like a shell
   done < "$file"
   [ "$found" -eq 1 ] && printf '%s' "$val"
   return 0
@@ -132,7 +176,7 @@ env_file_seed() {  # $1=file $2=KEY $3=default — write only if absent or empty
   if [ -z "$(env_file_get "$1" "$2")" ]; then
     if [ -s "$1" ] && [ -n "$(tail -c1 "$1")" ]; then printf '\n' >> "$1"; fi
     printf '%s=%s\n' "$2" "$3" >> "$1"
-    log "$1: seeded $2=$3"
+    log "$1: seeded $2"
   fi
 }
 
@@ -143,7 +187,7 @@ ensure_env() {
   fi
   [ -e "$ENV_FILE" ] || : > "$ENV_FILE"
   chmod 600 "$ENV_FILE"
-  env_file_seed "$ENV_FILE" PORT "$PORT"     # $PORT is port(), resolved at dispatch
+  env_file_seed "$ENV_FILE" PORT "$PORT"     # $PORT is port(), resolved below
   env_file_seed "$ENV_FILE" HOST "127.0.0.1"
   env_file_seed "$ENV_FILE" INCOMPETECH_DB "$DB_DEFAULT"
   chmod 600 "$ENV_FILE"
@@ -156,6 +200,7 @@ port() {
   # overwrites it, so an operator who moved the port there is the authority on
   # it; a probe that kept asking 8072 would report the site down while it
   # answered perfectly one port over.
+  local p
   if [ -n "${INCOMPETECH_PORT:-}" ]; then printf '%s' "$INCOMPETECH_PORT"; return 0; fi
   p="$(env_file_get "$ENV_FILE" PORT)"
   [ -n "$p" ] || p="$PORT_FALLBACK"
@@ -163,61 +208,138 @@ port() {
 }
 
 db_path() {
+  local path
   path="$(env_file_get "$ENV_FILE" INCOMPETECH_DB)"
   [ -n "$path" ] || path="$DB_DEFAULT"
   printf '%s' "$path"
 }
 
 # ---------------------------------------------------------------------------
-# pm2
+# pm2. Every pm2 call goes through pm2_clean, which launches it from an EMPTY
+# environment plus the handful of variables pm2 itself needs and PORT. pm2
+# copies the environment of the `pm2 start` call into the process, and from
+# there into ~/.pm2/dump.pm2 on save — so a plain `pm2 start` (or `pm2
+# restart --update-env`, which re-captures the shell on every deploy) gives
+# whatever the root shell holds an indefinite on-disk lifetime in the dump.
+# The daemon itself keeps the environment of whichever call first spawned it
+# (visible in its /proc/<pid>/environ for as long as it runs), which is why
+# jlist and logs go through here as well.
+#
+# PORT is handed in because this script knows it, it is not a secret, and an
+# app started from `env -i` would otherwise have no port. Everything else the
+# app needs comes from its own `.env`, which run.sh sources — never from the
+# shell that ran this script.
 # ---------------------------------------------------------------------------
+pm2_clean() {
+  env -i PATH="$PATH" HOME="$HOME" ${PM2_HOME:+PM2_HOME="$PM2_HOME"} \
+    ${TERM:+TERM="$TERM"} LANG=C.UTF-8 PORT="$PORT" pm2 "$@"
+}
+
+# `pm2 jlist` is JSON only on a good day: pm2 writes chatter to STDOUT ahead
+# of it — `[PM2] Spawning PM2 daemon…` when the daemon was down, `>>>> In-memory
+# PM2 is out-of-date` after a pm2 upgrade. So the JSON is taken from the first
+# line that starts one and parses; anything else is reported as unknown (exit
+# 1), never guessed as "not registered" — deploy would answer that guess with
+# a second `pm2 start` against a live app.
+PM2_JSON='import json, sys
+lines = sys.stdin.read().split("\n")
+for i, line in enumerate(lines):
+    if line[:1] in "[{":
+        try:
+            procs = json.loads("\n".join(lines[i:]))
+        except ValueError:
+            continue
+        if isinstance(procs, list):
+            json.dump(procs, sys.stdout); sys.exit(0)
+sys.exit("no parseable JSON in pm2 jlist output")'
+pm2_jlist() {   # -> JSON array on stdout; 1 with the reason on stderr
+  local jl
+  command -v pm2 >/dev/null || { echo "pm2 not on PATH" >&2; return 1; }
+  jl="$(pm2_clean jlist 2>/dev/null)" || { echo "pm2 jlist failed" >&2; return 1; }
+  printf '%s' "$jl" | python3 -c "$PM2_JSON"
+}
+
+# "not registered", "<status>  mode=…", or "unknown (…)" with exit 1.
 pm2_state() {
-  jl="$(pm2 jlist 2>/dev/null || true)"     # no pm2 / daemon down -> '' -> "not registered"
-  printf '%s' "$jl" \
-    | python3 -c "import json,sys
-try: procs=json.load(sys.stdin)
-except Exception: procs=[]
-p=[x for x in procs if x.get('name')=='$APP']
-if not p: print('not registered'); raise SystemExit
-e=p[0].get('pm2_env',{})
-print('%s  mode=%s  restarts=%s  uptime-since=%s' % (
-  e.get('status'), e.get('exec_mode'), e.get('restart_time'), e.get('pm_uptime')))" 2>/dev/null \
-    || printf 'unknown (pm2 not readable)\n'
+  local js
+  js="$(pm2_jlist 2>&1)" || { printf 'unknown (%s)\n' "$js"; return 1; }
+  printf '%s' "$js" | python3 -c 'import json, sys
+p = [x for x in json.load(sys.stdin) if x.get("name") == sys.argv[1]]
+if not p: print("not registered"); raise SystemExit
+e = p[0].get("pm2_env", {})
+print("%s  mode=%s  restarts=%s  uptime-since=%s" % (
+  e.get("status"), e.get("exec_mode"), e.get("restart_time"), e.get("pm_uptime")))' "$APP"
+}
+
+# Names of registered processes that are not online (empty = all online);
+# exit 1 with the reason when the list cannot be read.
+pm2_not_online() {
+  local js
+  js="$(pm2_jlist 2>&1)" || { printf '%s' "$js"; return 1; }
+  printf '%s' "$js" | python3 -c 'import json, sys
+print(" ".join(x.get("name", "?") for x in json.load(sys.stdin)
+               if x.get("pm2_env", {}).get("status") != "online"))'
 }
 
 save_if_online() {
   # pm2 save overwrites the dump with whatever is running right now, so a save
-  # while this app is down persists a dump that omits it and the next reboot
-  # comes back short. Save only when it is online.
-  case "$(pm2_state)" in
-    online*) pm2 save;;
-    *) warn "$APP is not online — skipping pm2 save so the dump keeps its last good state";;
-  esac
+  # while anything is down persists a dump that comes back short on the next
+  # reboot. The box rule (lab980 CLAUDE.md) is EVERY app online before a save,
+  # not just this one; otherwise say so and leave the previous dump alone.
+  local bad
+  if ! bad="$(pm2_not_online)"; then
+    warn "skipping pm2 save: cannot read the pm2 process list ($bad)"; return 0
+  fi
+  if [ -n "$bad" ]; then
+    warn "not every pm2 process is online ($bad) — skipping pm2 save so the dump keeps its last good state. Run \`pm2 save\` yourself once they are."
+    return 0
+  fi
+  pm2_clean save
 }
 
 # ---------------------------------------------------------------------------
 # Probes
 # ---------------------------------------------------------------------------
-probe() {
+probe() {  # $1 = attempts at the local probe, one second apart (default 1)
   # Local first, then public: a healthy app behind a broken vhost and a dead
   # app behind a fine vhost look identical from the outside, and telling them
   # apart is most of the diagnosis. /api/health answers 200 with "built":false
   # before the first build, which is a state to report rather than an outage.
+  #
+  # Returns 1 unless the local probe answered HTTP 200 — deploy and restart
+  # exit on that, because "pm2 was told to run it" is not "it is serving".
+  # The public result is printed either way: a good app behind a bad vhost is
+  # the finding, not something to hide behind the local failure.
+  local tries="${1:-1}" try=0 lcode="" lbody pcode
+  while :; do
+    try=$((try + 1))
+    lcode="$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "http://127.0.0.1:$PORT$HEALTH" || true)"
+    [ "$lcode" = "200" ] && break
+    [ "$try" -lt "$tries" ] || break
+    sleep 1
+  done
   lbody="$(curl -s --max-time 10 "http://127.0.0.1:$PORT$HEALTH" || true)"
-  lcode="$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "http://127.0.0.1:$PORT$HEALTH" || true)"
   pcode="$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "https://$FQDN$HEALTH" || true)"
+  [ "$pcode" != "000" ] || pcode=""
   printf 'local:     http://127.0.0.1:%s%s  ->  HTTP %s  %s\n' "$PORT" "$HEALTH" "${lcode:-unreachable}" "${lbody:-}"
   printf 'public:    https://%s%s  ->  HTTP %s\n' "$FQDN" "$HEALTH" "${pcode:-unreachable}"
   case "${lbody:-}" in
     *'"built":false'*) warn "the app is up but has no catalogue database — run: incompetech build";;
   esac
+  if [ "$lcode" = "200" ]; then
+    case "$pcode" in
+      ""|5*) warn "app answers locally but https://$FQDN$HEALTH is ${pcode:-unreachable} — look at nginx / DNS / TLS, not the app";;
+    esac
+    return 0
+  fi
+  return 1
 }
 
 upstream_family() {
   # Which loopback family answers on the port, and which one the vhost proxies
   # to. A process bound to [::1] behind a vhost saying `localhost` works by
   # accident, and `127.0.0.1` breaks it. This app binds HOST=127.0.0.1.
-  v4=no; v6=no; target=""
+  local v4=no v6=no target="" vhost
   curl -s -o /dev/null --max-time 3 "http://127.0.0.1:$PORT$HEALTH" && v4=yes
   curl -s -o /dev/null --max-time 3 "http://[::1]:$PORT$HEALTH" && v6=yes
   if vhost="$(vhost_path)"; then
@@ -236,6 +358,7 @@ upstream_family() {
 # provision-site writes is correct as written.
 # ---------------------------------------------------------------------------
 vhost_path() {  # -> path on stdout, exit 1 if none
+  local link
   if [ -e "$NGINX_AVAIL/$FQDN" ]; then readlink -f "$NGINX_AVAIL/$FQDN"; return 0; fi
   for link in "$NGINX_ENABLED"/*; do
     [ -e "$link" ] || continue
@@ -246,22 +369,46 @@ vhost_path() {  # -> path on stdout, exit 1 if none
   return 1
 }
 
-install_fallback_vhost() {
-  src="$ROOT/deploy/nginx-incompetech.conf"; conf="$NGINX_AVAIL/$FQDN"
+install_fallback_vhost() {  # no provision-site on PATH: HTTP-only vhost from deploy/nginx-incompetech.conf
+  local src="$ROOT/deploy/nginx-incompetech.conf" conf="$NGINX_AVAIL/$FQDN" link="$NGINX_ENABLED/$FQDN"
+  local prev_link
   [ -f "$src" ] || die "$src missing — cannot install the fallback vhost."
-  need_root
+  need_root setup
+  # sites-enabled entries are symlinks here. A regular file at that path is
+  # someone's hand-placed config; `ln -sf` would replace it and the rollback
+  # below would then delete it, so refuse before anything is written.
+  if [ -e "$link" ] && [ ! -L "$link" ]; then
+    die "$link exists and is not a symlink — refusing to replace it. Move it aside, then re-run setup."
+  fi
   log "provision-site not on PATH — installing HTTP-only vhost $conf from deploy/nginx-incompetech.conf"
   sed -e "s/incompetech\.lab980\.com/$FQDN/g" -e "s/127\.0\.0\.1:8072/127.0.0.1:$PORT/g" "$src" > "$conf"
-  ln -sf "$conf" "$NGINX_ENABLED/$FQDN"
-  if ! nginx -t; then rm -f "$conf" "$NGINX_ENABLED/$FQDN"; die "nginx -t rejected the fallback vhost; removed it."; fi
-  systemctl reload nginx
+  prev_link="$(readlink "$link" 2>/dev/null || true)"   # '' = no symlink before this run
+  ln -sfn "$conf" "$link"
+  # An explicit branch, not `nginx -t && systemctl reload nginx`: under set -e
+  # a failing left side of && is exempt from errexit, so that form would leave
+  # a rejected vhost enabled on disk and carry on — and the next reload or
+  # reboot would take every site on the box down with it. Undo exactly what
+  # this run put there, then stop.
+  if ! nginx -t; then
+    rm -f "$conf"
+    if [ -z "$prev_link" ]; then rm -f "$link"; else ln -sfn "$prev_link" "$link"; fi
+    die "nginx -t rejected the fallback vhost; removed $conf and its sites-enabled link. Fix deploy/nginx-incompetech.conf and re-run setup."
+  fi
+  systemctl reload nginx \
+    || die "nginx -t passed but the reload failed — $conf is on disk and enabled; nginx is still serving its previous config. Check: systemctl status nginx"
+  log "nginx: enabled and reloaded"
   warn "HTTP only. Point DNS at this box, then:  certbot --nginx -d $FQDN --redirect"
   warn "and, from the lab980 repo:  fix-security-headers --fix   (the fallback vhost has no headers include)"
 }
 
 cmd_setup() {
-  dry=""
-  [ "${1:-}" = "--dry-run" ] && dry="--dry-run"
+  local dry="" arg
+  for arg in "$@"; do
+    case "$arg" in
+      --dry-run) dry="--dry-run";;
+      *) die "setup: unknown option '$arg' (usage: incompetech setup [--dry-run])";;
+    esac
+  done
   cd "$ROOT"
   if vhost_path >/dev/null 2>&1; then
     log "vhost for $FQDN exists: $(vhost_path)"
@@ -272,13 +419,14 @@ cmd_setup() {
       log "dry run: provision-site not on PATH; would install deploy/nginx-incompetech.conf as $NGINX_AVAIL/$FQDN (HTTP only)"
     fi
   elif command -v provision-site >/dev/null 2>&1; then
-    need_root
+    need_root setup
     # --port is NOT optional: without it provision-site allocates the next free
     # port from 8060 and proxies to that, while .env and this script use 8072 —
     # nginx would then proxy to a port nothing is listening on. --dir keeps it
     # on this checkout, which it detects as an existing clone and leaves alone.
     log "running provision-site $STUB $REPO --port $PORT --dir $ROOT"
-    provision-site "$STUB" "$REPO" --port "$PORT" --dir "$ROOT"
+    provision-site "$STUB" "$REPO" --port "$PORT" --dir "$ROOT" \
+      || die "provision-site failed (exit $?) — DNS, vhost or certbot did not complete; fix the cause and re-run: incompetech setup"
   else
     install_fallback_vhost
   fi
@@ -294,7 +442,7 @@ cmd_build() {
   cd "$ROOT"
   [ -x "$PY" ] || die "no $PY — run: incompetech deploy"
   ensure_env
-  DB="$(db_path)"
+  local DB; DB="$(db_path)"
   INCOMPETECH_DB="$DB"; export INCOMPETECH_DB
   log "building $DB from incompetech.com (two requests, no key)"
   # The build writes beside the target and renames it into place, so the
@@ -304,19 +452,26 @@ cmd_build() {
 }
 
 cmd_deploy() {
-  DO_INSTALL=1; REBUILD=0
-  while [ $# -gt 0 ]; do
-    case "$1" in
+  local DO_INSTALL=1 REBUILD=0 arg
+  for arg in "$@"; do
+    case "$arg" in
       --no-install) DO_INSTALL=0;;
       --rebuild)    REBUILD=1;;
-      *) die "usage: incompetech deploy [--no-install] [--rebuild]";;
+      *) die "deploy: unknown option '$arg' (usage: incompetech deploy [--no-install] [--rebuild])";;
     esac
-    shift
   done
-  need_root
-  command -v pm2 >/dev/null 2>&1 || die "pm2 not found on PATH."
+  need_root deploy
+  command -v pm2 >/dev/null || die "pm2 not found on PATH."
   cd "$ROOT"
   git rev-parse --is-inside-work-tree >/dev/null 2>&1 || die "$ROOT is not a git clone."
+
+  # Decide start-vs-restart BEFORE the sync: `pm2 start` on a process pm2
+  # already holds is a silent no-op that looks exactly like a deploy, so an
+  # unreadable list is a stop — here, not after a hard reset it did not need.
+  local state
+  state="$(pm2_state)" || die "pm2: $state — cannot tell whether $APP is registered, so not starting or restarting it. Sort pm2 out first (pm2 ls), then deploy again."
+
+  local before after
   before="$(git rev-parse --short HEAD)"
   log "Syncing $ROOT to origin/$BRANCH"
   git fetch --quiet origin "$BRANCH"
@@ -325,14 +480,17 @@ cmd_deploy() {
   if [ "$before" = "$after" ]; then log "already current ($after)"
   else log "$before -> $after"; git --no-pager log --oneline "$before..$after"; fi
 
-  if [ "$DO_INSTALL" -eq 1 ]; then
-    # requirements.txt is deliberately ranged, not pinned (see its header), so
-    # this can resolve newer versions than the last deploy — there is no
-    # lockfile to hold it. The venv survives the hard reset (.venv/ is
-    # gitignored) and keeps what it has unless a range moved.
+  # pip, not npm: there is no package.json here. requirements.txt is
+  # deliberately ranged, not pinned (see its header), so this can resolve
+  # newer versions than the last deploy — there is no lockfile to hold it.
+  # The venv survives the hard reset (.venv/ is gitignored) and keeps what it
+  # has unless a range moved.
+  if [ "$DO_INSTALL" -eq 1 ] && [ -f requirements.txt ]; then
     if [ ! -x "$PY" ]; then log "creating .venv"; python3 -m venv .venv; fi
     log "pip install -r requirements.txt"
     "$PY" -m pip install --quiet -r requirements.txt
+  elif [ "$DO_INSTALL" -eq 1 ]; then
+    warn "no requirements.txt in $ROOT — nothing to install"
   fi
   mkdir -p data
   chmod +x run.sh 2>/dev/null || true
@@ -340,30 +498,35 @@ cmd_deploy() {
 
   if ! vhost_path >/dev/null 2>&1; then
     # No "deploy anyway" fallback: every failure inside cmd_setup goes through
-    # `die`, which exits this script, so a branch here that carried on was one
-    # that could never run. A deploy that cannot get a vhost stops, and says
-    # why, rather than starting an app nothing can reach.
+    # `die`, which exits this script. A deploy that cannot get a vhost stops,
+    # and says why, rather than starting an app nothing can reach.
     log "no vhost for $FQDN yet — running incompetech setup first"
     cmd_setup
   fi
 
-  case "$(pm2_state)" in
+  # The ecosystem file is the registration's source of truth, so it is
+  # re-read on every deploy (restart through it, not by bare name).
+  case "$state" in
     "not registered")
-      log "pm2 start $ECOSYSTEM ($APP, first registration)"
-      pm2 start "$ECOSYSTEM" --only "$APP"
+      log "pm2 start ${START_CMD[*]}  ($APP, first registration)"
+      pm2_clean start "${START_CMD[@]}"
+      state="$(pm2_state)" || die "pm2 start ran but the process list is unreadable — $state"
+      [ "$state" != "not registered" ] \
+        || die "pm2 start ran but nothing named $APP is registered — $ECOSYSTEM must name it."
       ;;
     *)
       log "pm2 restart $APP"
-      pm2 restart "$ECOSYSTEM" --only "$APP"
+      pm2_clean restart "$ECOSYSTEM" --only "$APP"
       ;;
   esac
-  sleep 2
+  probe "$PROBE_TRIES" \
+    || die "$(git rev-parse --short HEAD) is checked out and pm2 was told to run it, but 127.0.0.1:$PORT$HEALTH did not answer HTTP 200 — not deployed, nothing saved. Look at: incompetech logs"
   save_if_online
 
   # The database is derived and untracked, so a fresh box has none and a
   # deploy on an existing one must not spend two requests and a rebuild on
   # every push. Build when there is nothing to serve; refresh only when asked.
-  DB="$(db_path)"
+  local DB; DB="$(db_path)"
   if [ "$REBUILD" -eq 1 ]; then
     log "--rebuild: refreshing the catalogue"
     cmd_build
@@ -373,20 +536,23 @@ cmd_deploy() {
   else
     log "database present ($DB) — leaving it alone (incompetech deploy --rebuild to refresh)"
   fi
-
-  probe
   log "deployed: $(git rev-parse --short HEAD)  $(git log -1 --format=%s)"
 }
 
 cmd_restart() {
-  need_root; cd "$ROOT"
+  [ $# -eq 0 ] || die "restart: unknown option '$1' (usage: incompetech restart)"
+  need_root restart
+  command -v pm2 >/dev/null || die "pm2 not found on PATH."
+  cd "$ROOT"
+  local state
+  state="$(pm2_state)" || die "pm2: $state — cannot tell whether $APP is registered. Sort pm2 out first (pm2 ls), then retry."
+  [ "$state" != "not registered" ] || die "$APP is not registered with pm2 — nothing to restart. First start is: incompetech deploy"
   log "pm2 restart $APP"
-  pm2 restart "$ECOSYSTEM" --only "$APP"
-  sleep 2
-  probe
+  pm2_clean restart "$ECOSYSTEM" --only "$APP"
+  probe "$PROBE_TRIES" || die "$APP was restarted but 127.0.0.1:$PORT$HEALTH did not answer HTTP 200. Look at: incompetech logs"
 }
 
-cmd_logs() { pm2 logs "$APP" "$@"; }
+cmd_logs() { pm2_clean logs "$APP" "$@"; }
 
 cmd_status() {
   cd "$ROOT"
@@ -394,14 +560,14 @@ cmd_status() {
   printf 'dir:       %s\n' "$ROOT"
   if [ -x "$PY" ]; then printf 'python:    %s (%s)\n' "$("$PY" --version 2>&1)" "$PY"
   else printf 'python:    no .venv — run: incompetech deploy\n'; fi
-  printf 'pm2:       %s\n' "$(pm2_state)"
+  printf 'pm2:       %s\n' "$(pm2_state || true)"
   if [ -e "$ENV_FILE" ]; then
     printf 'env:       %s  PORT=%s  HOST=%s\n' "$ENV_FILE" \
       "$(env_file_get "$ENV_FILE" PORT)" "$(env_file_get "$ENV_FILE" HOST)"
   else
     printf 'env:       %s missing — run: incompetech deploy\n' "$ENV_FILE"
   fi
-  DB="$(db_path)"
+  local DB; DB="$(db_path)"
   if [ -s "$DB" ]; then
     printf 'database:  %s  %s  (%s)\n' "$DB" \
       "$(du -h "$DB" 2>/dev/null | cut -f1)" \
@@ -410,11 +576,13 @@ cmd_status() {
     printf 'database:  %s  ABSENT — run: incompetech build\n' "$DB"
   fi
   printf 'upstream:  %s\n' "$(upstream_family 2>&1)"
+  local vhost
   if vhost="$(vhost_path)"; then printf 'vhost:     %s\n' "$vhost"
   else printf 'vhost:     none for %s — run: incompetech setup\n' "$FQDN"; fi
-  probe
-  pem="/etc/letsencrypt/live/$FQDN/cert.pem"
+  probe || true      # status reports; deploy/restart are the ones that fail on it
+  local pem="/etc/letsencrypt/live/$FQDN/cert.pem"
   if [ -r "$pem" ]; then
+    local end days
     end="$(openssl x509 -enddate -noout -in "$pem" | cut -d= -f2)"
     days=$(( ($(date -d "$end" +%s) - $(date +%s)) / 86400 ))
     printf 'cert:      %s days remaining (expires %s)\n' "$days" "$end"
@@ -425,11 +593,11 @@ cmd_status() {
   fi
 }
 
-# Sourced for tests (INCOMPETECH_SOURCE_ONLY=1): define the functions, then
-# stop before resolving anything or dispatching.
-if [ -z "${INCOMPETECH_SOURCE_ONLY:-}" ]; then
-
 PORT="$(port)"      # after env_file_get exists, before any command reads $PORT
+
+# Sourced for tests (INCOMPETECH_SOURCE_ONLY=1): the functions are defined and
+# PORT resolved; stop before dispatching.
+if [ -z "${INCOMPETECH_SOURCE_ONLY:-}" ]; then
 
 case "${1:-}" in
   deploy)  shift; cmd_deploy "$@";;

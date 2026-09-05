@@ -39,10 +39,21 @@ about this site rather than about the platform. For the box itself, read the
 - **There are no platform keys and no secrets.** No API key, no credential, no
   write path: every route is a GET, and the one outbound request in the repo
   is the build fetching a public JSON document. So `bin/incompetech` carries
-  none of dnd-sim's key machinery — no `/etc/environment` adoption, no
-  `env -u` launch dance, no write token. `.env` holds three settings (`PORT`,
-  `HOST`, `INCOMPETECH_DB`), none of them sensitive. If this app ever does need
-  a secret, that is a decision to record here first.
+  none of dnd-sim's key machinery — no key-store adoption, no write token
+  (and since 2026-09-05 there is no box-level key store to adopt from anyway:
+  an app's `.env` is the only copy of any key it uses). `.env` holds three
+  settings (`PORT`, `HOST`, `INCOMPETECH_DB`), none of them sensitive. If this
+  app ever does need a secret, that is a decision to record here first — and
+  `.env` is where it would live, never the ecosystem file or pm2's argv.
+- **pm2 is launched scrubbed anyway.** Every pm2 call in `bin/incompetech`
+  goes through `pm2_clean` — `env -i` plus PATH, HOME, PM2_HOME and TERM when
+  set, `LANG`, and `PORT` — and never `--update-env`. That is the lab980
+  template's rule, not a property of this app: pm2 copies the calling shell's
+  environment into the process and, on `pm2 save`, into `~/.pm2/dump.pm2`,
+  so whatever the root shell happened to hold would otherwise get an
+  indefinite on-disk lifetime. The process gets `PORT` from the CLI and
+  everything else from `run.sh` sourcing `.env`. `pm2 save` runs only after
+  the local probe passes and only when *every* registered process is online.
 - **The database is derived, and lives in `data/`.** One command rebuilds it
   from `pieces.json`; it is gitignored for the same reason `.env` is, and
   survives a deploy's hard reset for the same reason too. Vendoring 1442 rows
@@ -72,6 +83,12 @@ outbound request at all.
 - Repo: `ivjames/incompetech` · droplet dir: `/var/www/incompetech`
 - pm2 process: **`incompetech`** (from `ecosystem.config.js`) — runs
   `./run.sh`, which sources `./.env` and execs `.venv/bin/python -m web.app`.
+  The ecosystem file's `env` block is `PORT`, `HOST` and `PYTHONUNBUFFERED`
+  only; `INCOMPETECH_DB` is `.env`'s alone (the app's own default is the same
+  `data/catalog.sqlite3` under the checkout). First registration is `pm2
+  start ecosystem.config.js --only incompetech` (`START_CMD` in the CLI);
+  every deploy after that restarts through the same file, so option changes
+  there are re-read.
   **fork mode**, `exec_mode: 'fork'` explicit: setting `instances` alone flips
   pm2 into cluster mode, whose startup crashes land in `~/.pm2/pm2.log` rather
   than this app's own error log — a crash-looping app with *empty* logs is that
@@ -108,8 +125,10 @@ Every time after:
 
 ```bash
 incompetech deploy      # reset to origin/main, venv + pip, .env, vhost via setup
-                        # if missing, pm2 start/restart, save if online, build the
-                        # database if there isn't one, probe
+                        # if missing, pm2 start/restart (scrubbed), probe — exit 1
+                        # unless 127.0.0.1:8072/api/health answers 200 — pm2 save
+                        # if every process is online, build the database if there
+                        # isn't one
 incompetech deploy --rebuild   # ... and refresh the catalogue from incompetech.com
 incompetech setup       # once, idempotent: provision-site (or the HTTP-only
                         # fallback vhost), pm2-root check; --dry-run shows what it would do
@@ -117,6 +136,8 @@ incompetech build       # rebuild the database (two requests, ~1 MB, no key) —
                         # atomic, so the running app keeps answering
 incompetech status      # HEAD, pm2, .env, database, upstream family, vhost,
                         # local + public /api/health, cert days
+incompetech restart     # pm2 restart + probe; exit 1 unless the local
+                        # /api/health answers 200
 incompetech logs        # tail this app's pm2 logs
 ```
 
@@ -170,6 +191,10 @@ in the process. What each step does and how to confirm what is live:
   droplet is in between `deploy` and the first `build`, and a health check that
   failed there would report the site down when it is up and waiting for one
   command. The page reads the same flag and says which command to run.
+- `bin/incompetech` is bash (the lab980 app template — `START_CMD` is an
+  array), sourced by `tests/test_cli.py` with `INCOMPETECH_SOURCE_ONLY=1` to
+  test its resolvers; unknown options to any command are an error, not
+  ignored.
 - Tests: `.venv/bin/python -m pytest -q` (everything);
   `.venv/bin/python -m pytest web/tests -q` for the web layer alone. No test
   touches the network — `tests/fixtures.py` is a handful of real catalogue rows
