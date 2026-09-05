@@ -17,17 +17,25 @@ about this site rather than about the platform. For the box itself, read the
 
 - The checkout dir is **`/var/www/incompetech`** (always `/var/www/<stub>` on
   this box).
-- The port is **8072 — provisional.** It is the first free one by lab980's
-  registry, but the registry does not yet carry every app on the droplet, so
-  **confirm it on the box before the first `incompetech setup`**:
+- The port is **8072 — provisional.** It is the next free one by lab980's
+  registry: 8069 is the highest entry there, 8070 is ffc's centeredge-mock
+  upstream (prose-only in lab980's `CLAUDE.md`, not a registry entry) and 8071
+  is dnd-sim. But nothing in this repo can reach the droplet, and a port is a
+  fact about the box rather than about a file, so **confirm it there before the
+  first `incompetech setup`**:
   `grep -rho 'proxy_pass http://127.0.0.1:[0-9]*' /etc/nginx/sites-enabled/ | sort -u`.
   It lives in three places — `.env`, `ecosystem.config.js` and
   `INCOMPETECH_PORT` in `bin/incompetech` — and changing it means changing all
   three plus the vhost.
-- **This site is not registered in `lab980.com`'s `.claude/sites.json` or its
-  prose site list until that PR lands.** Until then it is invisible to
-  `health-check`, to the conventions sweep and to whoever looks after the box
-  next. Registering it is a separate change in a separate repo.
+- **The site is registered in `lab980.com`** — `.claude/sites.json` and the
+  prose site list both carry it (PR #53), as shape `app`, dir
+  `/var/www/incompetech`, cli `bin/incompetech`. Its `port` is recorded as
+  `null` with `"port"` in `unverified`, because that registry's invariant is
+  that `unverified` lists the fields left null rather than the ones somebody
+  guessed; the provisional 8072 is in its `notes`. **Filling that port in, once
+  the droplet confirms it, is the remaining step** — and it is a change in that
+  repo, not this one. `health-check --site incompetech` will know the site as
+  soon as there is a vhost for it to probe.
 - **There are no platform keys and no secrets.** No API key, no credential, no
   write path: every route is a GET, and the one outbound request in the repo
   is the build fetching a public JSON document. So `bin/incompetech` carries

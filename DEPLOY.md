@@ -14,10 +14,16 @@ to be placed on the box before the first deploy.
 
 ## Before the first `setup`: confirm the port
 
-8072 is **provisional** — the first free port by lab980's registry, which does
-not yet list every app on the droplet. Check on the box, and if it is taken,
-change it in `.env`, `ecosystem.config.js` and `INCOMPETECH_PORT` in
-`bin/incompetech` (and the vhost) together:
+8072 is **provisional** — the next free port by lab980's registry, where 8069
+is the highest entry, 8070 is ffc's centeredge-mock upstream (prose-only in
+lab980's `CLAUDE.md`) and 8071 is dnd-sim. What no file can settle is whether
+something on the droplet is already listening on it, which is why the registry
+records this site's `port` as `null` with `"port"` in `unverified` rather than
+as fact. Check on the box; if it is taken, change it in `.env`,
+`ecosystem.config.js` and `INCOMPETECH_PORT` in `bin/incompetech` (and the
+vhost) together. Either way, **fill the confirmed port into lab980's
+`.claude/sites.json`** once you know it — that is the entry's one remaining
+hole:
 
 ```bash
 grep -rho 'proxy_pass http://127.0.0.1:[0-9]*' /etc/nginx/sites-enabled/ | sort -u
@@ -145,11 +151,13 @@ the catalogue is:
 ```bash
 curl -s https://incompetech.lab980.com/api/health
 incompetech logs                  # tail pm2 logs for this app
-health-check --site incompetech   # the droplet-wide auditor (once registered)
+health-check --site incompetech   # the droplet-wide auditor
 ```
 
-`health-check` only knows about sites listed in lab980's `.claude/sites.json`;
-this one is not registered there yet.
+`health-check` only knows about sites listed in lab980's `.claude/sites.json`,
+and this one is listed — so it will cover the site as soon as there is a vhost
+and a DNS record for it to probe. Its `port` there is still `null` and
+`unverified`; fill it in once the droplet has confirmed one.
 
 ## Overrides
 
