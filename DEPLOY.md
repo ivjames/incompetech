@@ -49,9 +49,24 @@ incompetech deploy
 ```
 
 That is the whole thing. `deploy` creates the venv, installs, writes `.env`,
-runs `setup` if there is no vhost yet, registers and starts the pm2 process,
-builds the catalogue database because there isn't one, and probes
-`/api/health` locally and publicly.
+runs `setup` if there is no vhost yet, registers and starts the pm2 process
+(`pm2 start ecosystem.config.js --only incompetech`, from a scrubbed
+environment — see below), probes `/api/health` locally and publicly, saves
+the pm2 dump, and builds the catalogue database because there isn't one.
+**`deploy` and `restart` exit non-zero unless `127.0.0.1:8072/api/health`
+answers 200** within `INCOMPETECH_PROBE_TRIES` seconds; a deploy that exits 1
+has the new code checked out but nothing saved, and says so.
+
+**pm2 and the environment.** Every pm2 call the CLI makes runs under `env -i`
+with only `PATH`, `HOME`, `PM2_HOME` and `TERM` (when set), `LANG` and
+`PORT` — never `--update-env`. pm2 copies the environment of the command that
+started a process into that process and into `~/.pm2/dump.pm2` on save, so
+this is what keeps whatever the root shell holds out of both. The app reads
+`.env` through `run.sh`; a setting it needs belongs there, not in the shell
+that ran `deploy`. `pm2 save` happens only after the probe passes and only
+when every registered process on the box is online — otherwise the previous
+dump is kept and the CLI says to run `pm2 save` yourself once they are.
+Anything started by hand should be launched the same way.
 
 `incompetech setup` on its own is the box-outward half, and is idempotent:
 
@@ -87,7 +102,7 @@ of them sensitive:
 |---|---|---|
 | `PORT` | `8072` | listen port — must match the vhost's `proxy_pass`. Sourced after pm2's env block, so it overrides `ecosystem.config.js` rather than having to agree with it |
 | `HOST` | `127.0.0.1` | listen address. nginx is the only thing that should reach it; binding `0.0.0.0` would publish the app around the vhost |
-| `INCOMPETECH_DB` | `/var/www/incompetech/data/catalog.sqlite3` | the catalogue database. `data/` is gitignored, so it survives a deploy |
+| `INCOMPETECH_DB` | `/var/www/incompetech/data/catalog.sqlite3` | the catalogue database. `data/` is gitignored, so it survives a deploy. `.env`'s alone — it is not in the ecosystem file's `env` block (that carries only `PORT`, `HOST`, `PYTHONUNBUFFERED`) |
 
 `run.sh` sources this file before exec'ing python, so the pm2-managed process
 and a hand `./run.sh` read exactly the same settings. Nothing else is read from
@@ -174,3 +189,5 @@ it covers the site.
 - `INCOMPETECH_BRANCH` — default `main`
 - `INCOMPETECH_PORT` — default `8072`
 - `INCOMPETECH_ENV_FILE` — default `./.env`
+- `INCOMPETECH_PROBE_TRIES` — default `10`: seconds `deploy`/`restart` give the
+  app to answer `/api/health` with 200 before calling it down

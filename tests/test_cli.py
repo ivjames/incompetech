@@ -3,6 +3,9 @@
 The script is sourced rather than run (`INCOMPETECH_SOURCE_ONLY=1` defines the
 functions and stops before dispatching), so the pure resolvers can be asked
 questions directly. Nothing here needs pm2, nginx, root or the network.
+
+It is bash (the lab980 app template: `START_CMD` is an array), so it is
+sourced with bash and parsed with `bash -n`.
 """
 
 from __future__ import annotations
@@ -17,15 +20,16 @@ CLI = Path(__file__).resolve().parent.parent / "bin" / "incompetech"
 
 def call(func: str, env_file: Path, **env: str) -> str:
     out = subprocess.run(
-        ["sh", "-c", f". {CLI}; {func}"],
+        ["bash", "-c", f"source {CLI}; {func}"],
         capture_output=True, text=True, check=True,
-        env={"PATH": "/usr/bin:/bin", "INCOMPETECH_SOURCE_ONLY": "1",
+        env={"PATH": "/usr/bin:/bin", "HOME": "/tmp",
+             "INCOMPETECH_SOURCE_ONLY": "1",
              "INCOMPETECH_ENV_FILE": str(env_file), **env})
     return out.stdout.strip()
 
 
 def test_the_script_parses(tmp_path):
-    subprocess.run(["sh", "-n", str(CLI)], check=True)
+    subprocess.run(["bash", "-n", str(CLI)], check=True)
 
 
 def test_the_port_comes_from_env_the_way_the_database_does(tmp_path):
@@ -60,3 +64,11 @@ def test_env_is_read_the_way_a_shell_would_read_it(tmp_path, quoting):
     env = tmp_path / ".env"
     env.write_text(quoting + "\n", encoding="utf-8")
     assert call("port", env) == "9099"
+
+
+def test_the_first_start_is_the_ecosystem_file(tmp_path):
+    """`deploy` registers the app through the ecosystem file, picked out by
+    name — that is what makes the first start and every restart the same
+    registration."""
+    assert call('printf "%s " "${START_CMD[@]}"', tmp_path / "absent.env") \
+        == "ecosystem.config.js --only incompetech"
