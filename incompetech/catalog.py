@@ -1,0 +1,788 @@
+"""The incompetech catalogue as a SQLite database you can actually filter.
+
+The catalogue page can search one substring over title, instruments and
+description and AND a set of feels. It cannot ask for a tempo, a duration, a
+collection, a category or an upload date, which are exactly the questions
+worth asking when you are looking for a piece to put under something. So the
+catalogue is normalised into SQLite once and queried locally after that.
+
+    python -m incompetech build
+    python -m incompetech query --feel Dark --feel Mysterious \
+        --bpm-max 90 --min-length 3:00
+
+The shape is ordinary: one row per piece keyed by `filename` (the only field
+in the catalogue that is unique — see `incompetech.py`), `genre` and
+`collection` as lookup tables, and `instrument` and `feel` as many-to-many
+relations, because "pieces with a choir and no drums" is a join and not a
+substring search. `piece_fts` is an FTS5 index over title and description
+where the interpreter has FTS5, and a LIKE scan where it does not.
+
+The database is a **build artefact**: one command rebuilds it (two requests —
+the catalogue JSON, and the page whose lookup tables it is checked against), so
+it is gitignored rather than committed. `build_file` writes it beside the
+target and `os.replace`s it into place, so a rebuild under the running web app
+swaps the file in one step and never leaves a half-built database where a
+request can open it.
+
+Nothing here imports Flask, and nothing here knows there is a web layer: the
+layering is one-way, `web` → this package.
+
+Everything in the catalogue is CC BY 4.0 to Kevin MacLeod. `meta` carries the
+licence, the attribution and the credit sentence, and every row `search`
+returns has a finished `credit` on it, so a row that leaves this database
+takes its obligation with it.
+"""
+
+from __future__ import annotations
+
+import datetime as _dt
+import json
+import os
+import sqlite3
+from pathlib import Path
+from collections import Counter
+from dataclasses import dataclass
+
+from . import incompetech as I
+
+__all__ = [
+    "SCHEMA",
+    "DEFAULT_DB",
+    "DB_ENV",
+    "db_path",
+    "Stats",
+    "connect",
+    "build",
+    "build_file",
+    "have_fts5",
+    "Filters",
+    "search",
+    "count",
+    "facets",
+    "parse_duration",
+    "meta",
+    "format_rows",
+]
+
+#: Where the database lives when nobody says otherwise. Under `data/`, which
+#: is gitignored and survives a deploy's hard reset — the database is derived
+#: and a build rewrites it, so it is untracked state like `.env` and not part
+#: of the checkout.
+DEFAULT_DB = Path("data/catalog.sqlite3")
+DB_ENV = "INCOMPETECH_DB"
+
+
+def db_path(explicit=None) -> Path:
+    """The database path: an explicit one, else $INCOMPETECH_DB, else the default.
+
+    One resolver, read by the CLI and by the web layer both, so the two cannot
+    disagree about which file a build just replaced.
+    """
+    if explicit:
+        return Path(explicit)
+    return Path(os.environ.get(DB_ENV) or DEFAULT_DB)
+
+
+SCHEMA = """
+PRAGMA foreign_keys = ON;
+
+CREATE TABLE meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+
+CREATE TABLE genre (
+    genre_id INTEGER PRIMARY KEY,           -- the catalogue's own genre id
+    name     TEXT NOT NULL UNIQUE
+);
+
+CREATE TABLE collection (
+    code      INTEGER PRIMARY KEY,          -- what a piece carries, NOT `id`
+    name      TEXT NOT NULL,
+    category  TEXT NOT NULL,
+    source_id INTEGER                       -- the page's other number
+);
+
+CREATE TABLE piece (
+    piece_id            INTEGER PRIMARY KEY,
+    -- The natural key. `uuid` repeats and comes in four shapes and `isrc`
+    -- repeats across pieces that are not the same music, so neither is
+    -- unique; both are kept as ordinary indexed columns.
+    filename            TEXT    NOT NULL UNIQUE,
+    title               TEXT    NOT NULL,
+    uuid                TEXT    NOT NULL DEFAULT '',
+    isrc                TEXT    NOT NULL DEFAULT '',
+    length_s            INTEGER,            -- NULL where the catalogue said 00:00:00
+    bpm                 INTEGER,            -- NULL where it said 0 or nothing
+    description         TEXT    NOT NULL DEFAULT '',
+    uploaded            TEXT,               -- ISO date, NULL if unparseable
+    genre_id            INTEGER REFERENCES genre(genre_id),
+    collection_code     INTEGER REFERENCES collection(code),
+    genre_raw           TEXT    NOT NULL DEFAULT '',
+    collection_raw      TEXT    NOT NULL DEFAULT '',
+    mp3_url             TEXT    NOT NULL,
+    page_url            TEXT,
+    video_url           TEXT,
+    sheetmusic_url      TEXT,
+    itunes_url          TEXT,
+    filmmusic_url       TEXT,
+    -- The catalogue's `wav` field, verbatim. It is not a WAV and not a
+    -- working audio URL: see incompetech.py. Never offer it as a download.
+    wav_link            TEXT
+);
+
+CREATE INDEX piece_bpm       ON piece(bpm);
+CREATE INDEX piece_length    ON piece(length_s);
+CREATE INDEX piece_uploaded  ON piece(uploaded);
+CREATE INDEX piece_genre     ON piece(genre_id);
+CREATE INDEX piece_coll      ON piece(collection_code);
+CREATE INDEX piece_isrc      ON piece(isrc);
+CREATE INDEX piece_uuid      ON piece(uuid);
+
+CREATE TABLE instrument (
+    instrument_id INTEGER PRIMARY KEY,
+    name          TEXT NOT NULL,            -- the commonest spelling
+    key           TEXT NOT NULL UNIQUE      -- case-folded, what a filter matches
+);
+
+CREATE TABLE piece_instrument (
+    piece_id      INTEGER NOT NULL REFERENCES piece(piece_id),
+    instrument_id INTEGER NOT NULL REFERENCES instrument(instrument_id),
+    ord           INTEGER NOT NULL DEFAULT 0,   -- the catalogue's own order
+    PRIMARY KEY (piece_id, instrument_id)
+);
+CREATE INDEX piece_instrument_rev ON piece_instrument(instrument_id);
+
+CREATE TABLE feel (
+    feel_id   INTEGER PRIMARY KEY,
+    name      TEXT NOT NULL,
+    key       TEXT NOT NULL UNIQUE,
+    -- 1 for the page's own 20-word vocabulary, 0 for a word one piece
+    -- invented ("Ren Faire", "Medieval"). Kept, not dropped, but tellable.
+    canonical INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE piece_feel (
+    piece_id INTEGER NOT NULL REFERENCES piece(piece_id),
+    feel_id  INTEGER NOT NULL REFERENCES feel(feel_id),
+    ord      INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (piece_id, feel_id)
+);
+CREATE INDEX piece_feel_rev ON piece_feel(feel_id);
+
+CREATE VIEW piece_full AS
+SELECT p.*, g.name AS genre, c.name AS collection, c.category AS collection_category
+FROM piece p
+LEFT JOIN genre g      ON g.genre_id = p.genre_id
+LEFT JOIN collection c ON c.code = p.collection_code;
+"""
+
+FTS_SCHEMA = """
+CREATE VIRTUAL TABLE piece_fts USING fts5(
+    title, description, content='piece', content_rowid='piece_id'
+);
+"""
+
+
+def connect(path) -> sqlite3.Connection:
+    conn = sqlite3.connect(str(path))
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+    return conn
+
+
+def have_fts5(conn: sqlite3.Connection) -> bool:
+    """Whether this interpreter's SQLite was built with FTS5.
+
+    Debian's is; a hand-built or minimal one may not be, and a dev tool that
+    refuses to run on that machine would be worse than one that falls back to
+    a LIKE scan over 1442 rows, which is instant anyway.
+    """
+    try:
+        conn.execute("CREATE VIRTUAL TABLE temp.fts5_probe USING fts5(x)")
+    except sqlite3.Error:
+        return False
+    conn.execute("DROP TABLE temp.fts5_probe")
+    return True
+
+
+@dataclass
+class Stats:
+    """What a build ingested — printed by the CLI, asserted by the tests."""
+
+    pieces: int = 0
+    skipped: int = 0
+    with_genre: int = 0
+    with_collection: int = 0
+    unresolved_genre: int = 0
+    unresolved_collection: int = 0
+    unresolved_either: int = 0
+    instruments: int = 0
+    feels: int = 0
+    non_canonical_feels: tuple[str, ...] = ()
+    with_bpm: int = 0
+    with_length: int = 0
+    fts: bool = False
+
+    def lines(self) -> list[str]:
+        out = [
+            f"{self.pieces} pieces ingested"
+            + (f" ({self.skipped} rows skipped)" if self.skipped else ""),
+            f"  genre resolved      {self.with_genre}/{self.pieces}"
+            f"  (unresolved {self.unresolved_genre})",
+            f"  collection resolved {self.with_collection}/{self.pieces}"
+            f"  (unresolved {self.unresolved_collection})",
+            f"  neither resolved    {self.unresolved_either}",
+            f"  bpm known           {self.with_bpm}/{self.pieces}",
+            f"  length known        {self.with_length}/{self.pieces}",
+            f"  {self.instruments} distinct instruments, {self.feels} distinct feels"
+            + (f" ({len(self.non_canonical_feels)} off-vocabulary: "
+               f"{', '.join(self.non_canonical_feels)})"
+               if self.non_canonical_feels else ""),
+            f"  full-text index     {'FTS5' if self.fts else 'none — LIKE fallback'}",
+        ]
+        return out
+
+
+def build(conn: sqlite3.Connection, rows, *, fetched_at: str | None = None) -> Stats:
+    """Normalise raw catalogue rows into an empty connection. Returns `Stats`.
+
+    The database is rebuilt whole rather than updated: it is derived from one
+    file, and a rebuild is one command. That is also why nothing here worries
+    about migrations.
+    """
+    conn.executescript(SCHEMA)
+    fts = have_fts5(conn)
+    if fts:
+        conn.executescript(FTS_SCHEMA)
+
+    pieces = I.normalize_catalog(rows)
+    stats = Stats(pieces=len(pieces), skipped=max(0, len(rows or ()) - len(pieces)), fts=fts)
+
+    conn.executemany("INSERT INTO genre (genre_id, name) VALUES (?, ?)",
+                     sorted(I.GENRES.items()))
+    conn.executemany(
+        "INSERT INTO collection (code, name, category, source_id) VALUES (?, ?, ?, ?)",
+        [(c.code, c.name, c.category, c.source_id) for c in I.COLLECTIONS])
+
+    # The commonest spelling wins the display name: the catalogue holds both
+    # "Piano" and "PIano", and 359 raw instrument strings are 313 instruments.
+    inst_names = _canonical_names(p.instruments for p in pieces)
+    feel_names = _canonical_names(p.feels for p in pieces)
+    canonical = {f.casefold() for f in I.FEELS}
+
+    conn.executemany("INSERT INTO instrument (instrument_id, name, key) VALUES (?, ?, ?)",
+                     [(i, name, key) for i, (key, name) in enumerate(inst_names.items(), 1)])
+    conn.executemany("INSERT INTO feel (feel_id, name, key, canonical) VALUES (?, ?, ?, ?)",
+                     [(i, name, key, int(key in canonical))
+                      for i, (key, name) in enumerate(feel_names.items(), 1)])
+    inst_id = {key: i for i, key in enumerate(inst_names, 1)}
+    feel_id = {key: i for i, key in enumerate(feel_names, 1)}
+
+    for pid, p in enumerate(pieces, 1):
+        conn.execute(
+            """INSERT INTO piece (
+                   piece_id, filename, title, uuid, isrc, length_s, bpm,
+                   description, uploaded, genre_id, collection_code,
+                   genre_raw, collection_raw, mp3_url, page_url, video_url,
+                   sheetmusic_url, itunes_url, filmmusic_url, wav_link)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (pid, p.filename, p.title, p.uuid, p.isrc, p.length_s, p.bpm,
+             p.description, p.uploaded, p.genre_id, p.collection_code,
+             p.genre_raw, p.collection_raw, p.mp3_url, p.page_url, p.video_url,
+             p.sheetmusic_url, p.itunes_url, p.filmmusic_url, p.wav_link))
+        conn.executemany("INSERT INTO piece_instrument VALUES (?, ?, ?)",
+                         [(pid, inst_id[n.casefold()], i)
+                          for i, n in enumerate(p.instruments)])
+        conn.executemany("INSERT INTO piece_feel VALUES (?, ?, ?)",
+                         [(pid, feel_id[n.casefold()], i)
+                          for i, n in enumerate(p.feels)])
+
+        stats.with_genre += p.genre is not None
+        stats.with_collection += p.collection is not None
+        stats.unresolved_genre += p.genre is None
+        stats.unresolved_collection += p.collection is None
+        stats.unresolved_either += p.genre is None and p.collection is None
+        stats.with_bpm += p.bpm is not None
+        stats.with_length += p.length_s is not None
+
+    if fts:
+        conn.execute("INSERT INTO piece_fts (rowid, title, description) "
+                     "SELECT piece_id, title, description FROM piece")
+
+    stats.instruments = len(inst_names)
+    stats.feels = len(feel_names)
+    stats.non_canonical_feels = tuple(
+        name for key, name in feel_names.items() if key not in canonical)
+
+    conn.executemany("INSERT INTO meta (key, value) VALUES (?, ?)", [
+        ("source", I.CATALOG_URL),
+        ("lookups", I.LOOKUPS_URL),
+        ("fetched_at", fetched_at or _dt.datetime.now(_dt.timezone.utc)
+                       .replace(microsecond=0).isoformat()),
+        ("pieces", str(stats.pieces)),
+        ("author", I.AUTHOR),
+        ("license", I.LICENSE),
+        ("license_url", I.LICENSE_URL),
+        ("license_name", "Creative Commons Attribution 4.0"),
+        # Attribution is a condition of using any of this, so it is stored
+        # rather than left for whoever reads the database to remember.
+        ("attribution", f"Music by {I.AUTHOR} (incompetech.com), licensed under "
+                        f"Creative Commons: By Attribution 4.0 — {I.LICENSE_URL}"),
+        ("fts", "5" if fts else ""),
+    ])
+    conn.commit()
+    return stats
+
+
+def _canonical_names(lists) -> dict[str, str]:
+    """Case-folded key → the spelling that appears most often, ties by first.
+
+    Sorted by key so a rebuild numbers the rows the same way twice.
+    """
+    counts: dict[str, Counter] = {}
+    for names in lists:
+        for name in names:
+            counts.setdefault(name.casefold(), Counter())[name] += 1
+    # `max` keeps the first of equally large items and a Counter counts in
+    # first-seen order, so a tie goes to the spelling the catalogue used first
+    # — not to the lexicographically greatest one, which would make a stray
+    # lowercase "tambourine" beat the "Tambourine" every other row spells.
+    return {key: max(c.items(), key=lambda kv: kv[1])[0]
+            for key, c in sorted(counts.items())}
+
+
+def build_file(path, rows, *, fetched_at: str | None = None) -> Stats:
+    """Build the database at `path`, atomically.
+
+    The web layer opens a connection per request and never holds one open, so
+    the only thing a rebuild has to guarantee is that no request ever opens a
+    half-built file. It is built under a temporary name **beside the target**
+    — the same directory, so the same filesystem, which is what makes the
+    `os.replace` below a single rename rather than a copy — and moved into
+    place in one atomic step. A request that opened the old file keeps reading
+    it until it closes; the next one gets the new one. A build that fails
+    leaves the previous database exactly as it was.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.building-{os.getpid()}")
+    tmp.unlink(missing_ok=True)
+    try:
+        conn = connect(tmp)
+        try:
+            stats = build(conn, rows, fetched_at=fetched_at)
+        finally:
+            conn.close()
+        # The rename is atomic against other processes; on its own it is not
+        # atomic against power loss. A rename can reach the disk before the
+        # blocks it names do, and what is then under the canonical name is a
+        # file that opens and is not a database — the one corruption this
+        # design can actually produce. So the contents are flushed first, and
+        # then the directory entry, which is what makes the rename durable.
+        fd = os.open(tmp, os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.replace(tmp, path)       # atomic: same directory, same filesystem
+        dir_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    except BaseException:
+        # Anything at all — a malformed catalogue, a full disk, a Ctrl-C —
+        # takes the half-built file with it. What is left is the database
+        # that was already there, whole.
+        tmp.unlink(missing_ok=True)
+        raise
+    return stats
+
+
+def meta(conn: sqlite3.Connection) -> dict[str, str]:
+    try:
+        return {r["key"]: r["value"] for r in conn.execute("SELECT key, value FROM meta")}
+    except sqlite3.Error:
+        return {}
+
+
+# ------------------------------------------------------------------ query
+
+SORTS = {
+    "title": "p.title COLLATE NOCASE",
+    "length": "p.length_s",
+    "bpm": "p.bpm",
+    "uploaded": "p.uploaded",
+    "genre": "genre COLLATE NOCASE, p.title COLLATE NOCASE",
+    "collection": "collection COLLATE NOCASE, p.title COLLATE NOCASE",
+}
+
+
+@dataclass
+class Filters:
+    """Everything the CLI can ask for. Empty fields ask for nothing.
+
+    `feels` and `instruments` AND: three feels means a piece carrying all
+    three, which is the filter the whole exercise is for. `feels_any`,
+    `genres`, `collections` and `categories` OR within themselves and AND with
+    everything else.
+    """
+
+    text: str = ""
+    feels: tuple[str, ...] = ()
+    feels_any: tuple[str, ...] = ()
+    instruments: tuple[str, ...] = ()
+    genres: tuple[str, ...] = ()
+    collections: tuple[str, ...] = ()
+    categories: tuple[str, ...] = ()
+    bpm_min: int | None = None
+    bpm_max: int | None = None
+    bpm_unknown: bool = False       # rows the catalogue never measured
+    length_min: int | None = None
+    length_max: int | None = None
+    uploaded_from: str = ""
+    uploaded_to: str = ""
+    limit: int = 25
+    offset: int = 0
+    sort: str = "title"
+    desc: bool = False
+
+
+def _words(text: str) -> list[tuple[str, bool]]:
+    """The words a text filter asks for, each with whether it ended in "*".
+
+    Both search paths tokenise here, because both have to answer the same
+    question — every word must appear — and a phrase that means one thing
+    under FTS5 and another under the fallback would be worse than no fallback.
+    A text with no word in it at all ("*") yields none, and `search` refuses
+    it rather than quietly searching for everything.
+    """
+    out: list[tuple[str, bool]] = []
+    for word in text.split():
+        star = word.endswith("*")
+        body = word[:-1] if star else word
+        if body:
+            out.append((body, star))
+    return out
+
+
+def _fts_query(text: str) -> str:
+    """A plain phrase as an FTS5 MATCH that cannot be a syntax error.
+
+    Each word is quoted, so "-", ":" and "NOT" are searched for rather than
+    obeyed; a trailing "*" is kept outside the quotes so prefix search still
+    works. Words AND, which is what someone typing two words means.
+    """
+    return " ".join('"' + body.replace('"', '""') + '"' + ("*" if star else "")
+                    for body, star in _words(text))
+
+
+def _like(value: str) -> str:
+    """A user's string as the body of a LIKE pattern, wildcards defused.
+
+    "%" and "_" are LIKE's own wildcards, so without this `--collection '%'`
+    returns the whole catalogue rather than nothing. Every LIKE below pairs
+    this with ESCAPE '\\'.
+    """
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def _where(conn: sqlite3.Connection, f: Filters) -> tuple[list[str], list]:
+    """The WHERE clauses `f` asks for, and their arguments.
+
+    Split out so `search` and `count` ask the same question of the same rows:
+    a total that came from different SQL than the page under it would be a
+    number nobody could reproduce. Raises `ValueError` for the filters that
+    cannot mean anything — see `search`.
+    """
+    where: list[str] = []
+    args: list = []
+
+    if f.text:
+        words = _words(f.text)
+        if not words:
+            # Every character was punctuation the search treats as syntax
+            # ("*"). Dropping the filter here would answer a question nobody
+            # asked — the whole catalogue, reported as a match — so say so.
+            raise ValueError(f"--text {f.text!r} holds no word to search for")
+        # Whether *this* interpreter can query the index, not whether the one
+        # that built the file could: a .sqlite3 is portable and FTS5 is an
+        # optional module, so `meta.fts` alone would MATCH against a table
+        # this SQLite cannot read.
+        if have_fts5(conn) and meta(conn).get("fts"):
+            where.append("p.piece_id IN (SELECT rowid FROM piece_fts "
+                         "WHERE piece_fts MATCH ?)")
+            args.append(_fts_query(f.text))
+        else:
+            # No FTS5 here: a LIKE scan over 1442 rows costs nothing. One
+            # clause per word, ANDed, because that is what MATCH does — a
+            # single `%dark forest%` would ask for the phrase and find nothing.
+            # A trailing "*" needs nothing: `%word%` is already a prefix match.
+            for body, _star in words:
+                where.append(r"(p.title LIKE ? ESCAPE '\' "
+                             r"OR p.description LIKE ? ESCAPE '\')")
+                args += [f"%{_like(body)}%"] * 2
+
+    # One EXISTS per feel: N clauses ANDed is the AND, unambiguously.
+    for name in f.feels:
+        where.append("EXISTS (SELECT 1 FROM piece_feel pf JOIN feel fe "
+                     "ON fe.feel_id = pf.feel_id "
+                     "WHERE pf.piece_id = p.piece_id AND fe.key = ?)")
+        args.append(name.casefold())
+    if f.feels_any:
+        where.append("EXISTS (SELECT 1 FROM piece_feel pf JOIN feel fe "
+                     "ON fe.feel_id = pf.feel_id WHERE pf.piece_id = p.piece_id "
+                     f"AND fe.key IN ({_marks(f.feels_any)}))")
+        args += [n.casefold() for n in f.feels_any]
+
+    # Instruments match as substrings, so "drum" finds "Drums" and "Log
+    # Drums" — 313 free-text names are not a vocabulary anyone can recite.
+    for name in f.instruments:
+        where.append("EXISTS (SELECT 1 FROM piece_instrument pi JOIN instrument ins "
+                     "ON ins.instrument_id = pi.instrument_id "
+                     r"WHERE pi.piece_id = p.piece_id AND ins.key LIKE ? ESCAPE '\')")
+        args.append(f"%{_like(name.casefold())}%")
+
+    if f.genres:
+        where.append(f"(g.name COLLATE NOCASE IN ({_marks(f.genres)}) "
+                     f"OR p.genre_id IN ({_marks(f.genres)}))")
+        args += list(f.genres)
+        args += [_int_or_none(x) for x in f.genres]
+    if f.collections:
+        where.append("(" + " OR ".join(
+            [r"c.name LIKE ? ESCAPE '\'"] * len(f.collections)) + ")")
+        args += [f"%{_like(n)}%" for n in f.collections]
+    if f.categories:
+        where.append("(" + " OR ".join(
+            [r"c.category LIKE ? ESCAPE '\'"] * len(f.categories)) + ")")
+        args += [f"%{_like(n)}%" for n in f.categories]
+
+    # A NULL bpm or length is "the catalogue does not know", so a range must
+    # not return it — SQL does that for us, and `--bpm-unknown` is how you ask
+    # for those rows on purpose.
+    if f.bpm_unknown:
+        if f.bpm_min is not None or f.bpm_max is not None:
+            # Silently winning would report a tempo range that was never
+            # applied: these ask for opposite things, so neither wins.
+            raise ValueError("--bpm-unknown asks for the pieces with no tempo at "
+                             "all, so it cannot be combined with --bpm-min or "
+                             "--bpm-max")
+        where.append("p.bpm IS NULL")
+    else:
+        if f.bpm_min is not None:
+            where.append("p.bpm >= ?")
+            args.append(f.bpm_min)
+        if f.bpm_max is not None:
+            where.append("p.bpm <= ?")
+            args.append(f.bpm_max)
+    if f.length_min is not None:
+        where.append("p.length_s >= ?")
+        args.append(f.length_min)
+    if f.length_max is not None:
+        where.append("p.length_s <= ?")
+        args.append(f.length_max)
+    # `uploaded` is stored as an ISO date and compared as text, so a bound
+    # that is not one compares wrong rather than failing: "2019" sorts before
+    # "2019-01-01" and quietly excludes the whole year it looks like it asks
+    # for. Same shape `parse_date` holds the column itself to.
+    for flag, bound in (("--since", f.uploaded_from), ("--until", f.uploaded_to)):
+        if bound and I.parse_date(bound) is None:
+            raise ValueError(f"{flag} {bound!r} is not a date; write it YYYY-MM-DD")
+    if f.uploaded_from:
+        where.append("p.uploaded >= ?")
+        args.append(f.uploaded_from)
+    if f.uploaded_to:
+        where.append("p.uploaded <= ?")
+        args.append(f.uploaded_to)
+
+    return where, args
+
+
+#: The joins every filter is written against. `genres`, `collections` and
+#: `categories` match on the resolved names, so counting has to join exactly
+#: as searching does.
+_JOINS = """
+        FROM piece p
+        LEFT JOIN genre g      ON g.genre_id = p.genre_id
+        LEFT JOIN collection c ON c.code = p.collection_code
+"""
+
+
+def search(conn: sqlite3.Connection, f: Filters) -> list[dict]:
+    """Rows matching `f`, newest joins resolved, as plain dicts."""
+    where, args = _where(conn, f)
+
+    order = SORTS.get(f.sort, SORTS["title"])
+    if f.desc:
+        order = ", ".join(f"{part.strip()} DESC" for part in order.split(","))
+    # NULL tempos and lengths sort last whichever way the sort runs: an
+    # unknown is not the slowest piece in the catalogue.
+    if f.sort in ("bpm", "length", "uploaded"):
+        order = f"({SORTS[f.sort]} IS NULL), {order}"
+
+    sql = f"""
+        SELECT p.*, g.name AS genre, c.name AS collection,
+               c.category AS collection_category,
+               -- group_concat has no ordering of its own, so the rows are
+               -- ordered first and aggregated outside: what comes back is
+               -- the catalogue's own listing order, lead instrument first.
+               (SELECT group_concat(name, ', ') FROM
+                   (SELECT fe.name AS name FROM piece_feel pf
+                      JOIN feel fe ON fe.feel_id = pf.feel_id
+                     WHERE pf.piece_id = p.piece_id ORDER BY pf.ord)) AS feels,
+               (SELECT group_concat(name, ', ') FROM
+                   (SELECT ins.name AS name FROM piece_instrument pi
+                      JOIN instrument ins ON ins.instrument_id = pi.instrument_id
+                     WHERE pi.piece_id = p.piece_id ORDER BY pi.ord)) AS instruments
+        {_JOINS}
+        {"WHERE " + " AND ".join(where) if where else ""}
+        ORDER BY {order}
+        {_limit_clause(f)}
+    """
+    # SQLite has no bare OFFSET: it is only legal after a LIMIT, and -1 is the
+    # documented way to say "all the rest" — which is what a page N of an
+    # unlimited query asks for.
+    if f.limit and f.limit > 0:
+        args.append(f.limit)
+    elif f.offset > 0:
+        args.append(-1)
+    if f.offset > 0:
+        args.append(f.offset)
+
+    rows = []
+    for r in conn.execute(sql, args):
+        d = dict(r)
+        d["feels"] = [x for x in (d.get("feels") or "").split(", ") if x]
+        d["instruments"] = [x for x in (d.get("instruments") or "").split(", ") if x]
+        d["credit"] = I.credit_line(d["title"])
+        rows.append(d)
+    return rows
+
+
+def parse_duration(text) -> int:
+    """A duration as whole seconds, written "210", "3:30" or "1:02:03".
+
+    A bad one is a `ValueError` naming the accepted forms, because both
+    callers — the CLI and the web layer — turn that into a message rather than
+    a traceback. One parser, so `--min-length` and `?min_length=` cannot come
+    to disagree about what "3:00" means.
+    """
+    total = 0
+    for part in str(text).split(":"):
+        try:
+            total = total * 60 + int(part or 0)
+        except ValueError:
+            raise ValueError(f"{text!r} is not a duration; write it as 210, "
+                             "3:30 or 1:02:03") from None
+    return total
+
+
+def _limit_clause(f: Filters) -> str:
+    if f.limit and f.limit > 0:
+        return "LIMIT ?" + (" OFFSET ?" if f.offset > 0 else "")
+    return "LIMIT ? OFFSET ?" if f.offset > 0 else ""
+
+
+def count(conn: sqlite3.Connection, f: Filters) -> int:
+    """How many pieces match, ignoring `limit` and `offset`.
+
+    A `count(*)`, not `len(search(...))`. Counting by materialising was the
+    only unbounded query the API could reach: every matching row came back
+    with both `group_concat` subqueries run over it, so that the length of the
+    list could be taken and the list thrown away — and then the page was
+    fetched again. The whole catalogue is small enough that nobody would
+    notice, which is exactly why it would have gone on being written that way.
+    """
+    where, args = _where(conn, f)
+    sql = f"""SELECT count(*) {_JOINS}
+              {"WHERE " + " AND ".join(where) if where else ""}"""
+    return conn.execute(sql, args).fetchone()[0]
+
+
+def facets(conn: sqlite3.Connection) -> dict:
+    """What the whole catalogue offers, for a UI to build its controls from.
+
+    Counts are over every piece, not over the current result set: a control
+    that renumbered itself on each query would hide the option you were about
+    to widen to. Collections come grouped by category because that is the
+    shape the catalogue page has them in and the shape a two-step picker
+    wants; a collection with no pieces in it is still listed, since an empty
+    shelf is a fact about the catalogue.
+    """
+    feels = [dict(r) for r in conn.execute(
+        """SELECT fe.name AS name, fe.key AS key, fe.canonical AS canonical,
+                  count(pf.piece_id) AS count
+             FROM feel fe LEFT JOIN piece_feel pf ON pf.feel_id = fe.feel_id
+            GROUP BY fe.feel_id ORDER BY fe.canonical DESC, fe.name COLLATE NOCASE""")]
+    instruments = [dict(r) for r in conn.execute(
+        """SELECT ins.name AS name, ins.key AS key, count(pi.piece_id) AS count
+             FROM instrument ins
+             LEFT JOIN piece_instrument pi ON pi.instrument_id = ins.instrument_id
+            GROUP BY ins.instrument_id
+            ORDER BY count DESC, ins.name COLLATE NOCASE""")]
+    genres = [dict(r) for r in conn.execute(
+        """SELECT g.genre_id AS genre_id, g.name AS name, count(p.piece_id) AS count
+             FROM genre g LEFT JOIN piece p ON p.genre_id = g.genre_id
+            GROUP BY g.genre_id ORDER BY g.name COLLATE NOCASE""")]
+    rows = conn.execute(
+        """SELECT c.category AS category, c.name AS name, c.code AS code,
+                  count(p.piece_id) AS count
+             FROM collection c LEFT JOIN piece p ON p.collection_code = c.code
+            GROUP BY c.code
+            ORDER BY c.category COLLATE NOCASE, c.name COLLATE NOCASE""")
+    categories: list[dict] = []
+    for r in rows:
+        if not categories or categories[-1]["category"] != r["category"]:
+            categories.append({"category": r["category"], "collections": []})
+        categories[-1]["collections"].append(
+            {"name": r["name"], "code": r["code"], "count": r["count"]})
+    return {"feels": feels, "instruments": instruments, "genres": genres,
+            "categories": categories, "sorts": sorted(SORTS)}
+
+
+def _marks(seq) -> str:
+    return ", ".join("?" for _ in seq)
+
+
+def _int_or_none(v):
+    try:
+        return int(str(v).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+# ----------------------------------------------------------------- output
+
+
+def hms(secs) -> str:
+    if secs is None:
+        return "  ?  "
+    secs = int(secs)
+    h, rest = divmod(secs, 3600)
+    m, s = divmod(rest, 60)
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+
+
+def format_rows(rows: list[dict]) -> str:
+    """A readable table. `--json` is the scriptable form; this one is for eyes."""
+    if not rows:
+        return "no pieces match"
+    width = 34
+    out = [f"{'TITLE':<{width}} {'LEN':>7} {'BPM':>4}  {'GENRE':<17} "
+           f"{'COLLECTION':<20} FEELS"]
+    for r in rows:
+        title = r["title"]
+        if len(title) > width:
+            title = title[:width - 1] + "…"
+        out.append(
+            f"{title:<{width}} {hms(r['length_s']):>7} "
+            f"{(r['bpm'] if r['bpm'] is not None else '—'):>4}  "
+            f"{(r['genre'] or '—'):<17.17} {(r['collection'] or '—'):<20.20} "
+            f"{', '.join(r['feels'])}")
+    return "\n".join(out)
+
+
+def dump_json(rows: list[dict], meta_: dict) -> str:
+    return json.dumps({"meta": meta_, "count": len(rows), "pieces": rows},
+                      indent=1, ensure_ascii=False)
