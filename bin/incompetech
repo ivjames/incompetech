@@ -1,101 +1,166 @@
-#!/usr/bin/env bash
+#!/bin/sh
 # incompetech — operate CLI for incompetech.lab980.com (incompetech catalog).
 #
-# A proxied app site: nginx fronts a pm2-managed Node process on
-# 127.0.0.1:8072. Bring-up is `provision-site` (see lab980's CLAUDE.md);
-# this script owns everything after that:
+# A proxied app site: nginx fronts a pm2-managed Python/Flask process on
+# 127.0.0.1:8072. The pm2 process is `incompetech` (ecosystem.config.js),
+# which runs ./run.sh, which sources ./.env and execs
+# .venv/bin/python -m web.app. No Node, no npm, no build step: the install is
+# pip into .venv. There is no hand runbook — this script carries the whole
+# bring-up and every deploy, idempotently.
 #
-#   incompetech deploy    git pull -> npm ci -> build -> pm2 restart -> health probe
-#   incompetech restart   pm2 restart + probe, no code change
-#   incompetech logs      tail the pm2 logs for this app
-#   incompetech status    HEAD, pm2 state, local + public probe, cert days
+#   incompetech deploy     sync to origin/main, venv + pip, .env, vhost if
+#                          missing (-> setup), pm2 start/restart, build the
+#                          database if there isn't one, probe
+#   incompetech setup      box-outward half, once: provision-site (DNS, vhost,
+#                          TLS) or the HTTP-only fallback vhost; pm2 boot hook
+#   incompetech build      rebuild the catalogue database from incompetech.com
+#   incompetech restart    pm2 restart + probe, no code change
+#   incompetech status     HEAD, pm2, .env, database, upstream, vhost, probes
+#   incompetech logs       tail the pm2 logs for this app
 #
-# Env overrides:
-#   INCOMPETECH_FQDN     default incompetech.lab980.com
-#   INCOMPETECH_BRANCH   default main
-#   INCOMPETECH_PORT     default 8072
+# THIS SITE HOLDS NO SECRETS. There is no API key, no credential and no write
+# path: the app reads one SQLite file built from a public JSON document and
+# answers GETs. So there is deliberately nothing here resembling dndsim's key
+# machinery — no adoption from /etc/environment, no `env -u` launch, no write
+# token. `.env` carries three settings (PORT, HOST, INCOMPETECH_DB), none of
+# them sensitive, and it is still mode 600 and gitignored because a runtime
+# config file is untracked state either way. If this app ever does need a
+# secret, that is a decision to record in CLAUDE.md, not a line to slip in.
+#
+# The database is the other piece of untracked state. It is DERIVED — one
+# command rebuilds it from https://incompetech.com/music/royalty-free/pieces.json
+# — so it is not in git, lives in data/ beside .env, and survives the hard
+# reset below. `deploy` builds it only when it is missing; `deploy --rebuild`
+# refreshes it deliberately, which is what you run when Kevin MacLeod has
+# published something new.
+#
+# POSIX sh on purpose: no arrays, no bashisms, so `sh -n bin/incompetech`
+# passes anywhere and the script runs under dash as well as bash.
 #
 # The app dir is wherever this script's checkout lives (normally
 # /var/www/incompetech) — derived from the script's own path, so the
 # /usr/local/bin symlink resolves back here.
-set -euo pipefail
+set -eu
 
 SELF="$(readlink -f "$0")"
 ROOT="$(cd "$(dirname "$SELF")/.." && pwd)"
 FQDN="${INCOMPETECH_FQDN:-incompetech.lab980.com}"
 BRANCH="${INCOMPETECH_BRANCH:-main}"
 PORT="${INCOMPETECH_PORT:-8072}"
-APP="incompetech"
+ENV_FILE="${INCOMPETECH_ENV_FILE:-$ROOT/.env}"
+REPO="ivjames/incompetech"
+STUB="incompetech"
+APP="incompetech"               # pm2 process name, from ecosystem.config.js
+ECOSYSTEM="ecosystem.config.js"
+PY=".venv/bin/python"           # relative to $ROOT; run.sh picks the same one
+HEALTH="/api/health"            # {"ok":true,"built":bool,"pieces":n,...}
+DB_DEFAULT="$ROOT/data/catalog.sqlite3"
+NGINX_AVAIL="${NGINX_AVAIL:-/etc/nginx/sites-available}"
+NGINX_ENABLED="${NGINX_ENABLED:-/etc/nginx/sites-enabled}"
 
-c_blue=$'\033[1;34m'; c_yellow=$'\033[1;33m'; c_red=$'\033[1;31m'; c_off=$'\033[0m'
+c_blue=$(printf '\033[1;34m'); c_yellow=$(printf '\033[1;33m')
+c_red=$(printf '\033[1;31m');  c_off=$(printf '\033[0m')
 log()  { printf '%s==>%s %s\n' "$c_blue" "$c_off" "$*"; }
 warn() { printf '%swarn:%s %s\n' "$c_yellow" "$c_off" "$*" >&2; }
 die()  { printf '%serror:%s %s\n' "$c_red" "$c_off" "$*" >&2; exit 1; }
 
 usage() {
   cat <<'USAGE'
-incompetech — operate incompetech.lab980.com (pm2 app behind nginx).
+incompetech — operate incompetech.lab980.com (Python/Flask app behind nginx,
+pm2 process incompetech).
 
 Usage:
-  incompetech deploy [--no-build]   pull, install, build, restart, probe
-  incompetech restart               pm2 restart + probe
-  incompetech logs [-n N]           tail pm2 logs
-  incompetech status                HEAD + pm2 + local/public probe + cert
+  incompetech deploy [--no-install] [--rebuild]
+                          sync to origin/main, venv + pip, .env, vhost if
+                          missing (runs setup), pm2 start/restart, probe.
+                          Builds the catalogue database only when there is
+                          none; --rebuild refreshes it from incompetech.com
+  incompetech setup [--dry-run]
+                          once per box, idempotent: DNS + vhost + TLS via
+                          provision-site, or the HTTP-only fallback vhost from
+                          deploy/nginx-incompetech.conf; pm2 boot-hook check
+  incompetech build [--from-file F]
+                          rebuild the catalogue database (two requests, ~1 MB,
+                          no key). Atomic: the running app keeps answering
+  incompetech restart      pm2 restart + probe (re-reads .env)
+  incompetech status       HEAD, pm2, .env, database, upstream, vhost, probes,
+                           cert days
+  incompetech logs [-n N]  tail pm2 logs
 
-Env: INCOMPETECH_FQDN, INCOMPETECH_BRANCH (default main), INCOMPETECH_PORT (default 8072).
+First time on the droplet (as root), the whole bring-up is:
+  git clone https://github.com/ivjames/incompetech /var/www/incompetech
+  ln -sf /var/www/incompetech/bin/incompetech /usr/local/bin/incompetech
+  incompetech deploy
+
+No keys, no secrets, no hand steps: this app reads a public JSON document and
+serves a database built from it.
+
+Env: INCOMPETECH_FQDN, INCOMPETECH_BRANCH (default main),
+     INCOMPETECH_PORT (default 8072), INCOMPETECH_ENV_FILE (default ./.env).
 USAGE
 }
 
-probe() {
-  # Local first, then public: a healthy app behind a broken vhost and a dead
-  # app behind a fine vhost look identical from the outside, and telling them
-  # apart is most of the diagnosis.
-  local lcode pcode
-  lcode="$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "http://127.0.0.1:$PORT/" || true)"
-  pcode="$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "https://$FQDN/" || true)"
-  printf 'local:     http://127.0.0.1:%s/  ->  HTTP %s\n' "$PORT" "${lcode:-unreachable}"
-  printf 'public:    https://%s/  ->  HTTP %s\n' "$FQDN" "${pcode:-unreachable}"
+need_root() { [ "$(id -u)" -eq 0 ] || die "run as root."; }
+
+# ---------------------------------------------------------------------------
+# .env. Three settings, none of them a secret, seeded once and never
+# overwritten — an operator who changed one on the box meant it.
+# ---------------------------------------------------------------------------
+env_file_get() {  # $1=file $2=KEY -> value on stdout ('' if absent)
+  file="$1"; key="$2"; val=""; found=0
+  [ -r "$file" ] || return 0
+  while IFS= read -r line || [ -n "$line" ]; do
+    line="${line%$(printf '\r')}"
+    line="${line#"${line%%[![:space:]]*}"}"
+    case "$line" in ''|'#'*) continue;; esac
+    case "$line" in export[[:space:]]*) line="${line#export}"
+      line="${line#"${line%%[![:space:]]*}"}";; esac
+    case "$line" in "$key="*) ;; *) continue;; esac
+    val="${line#*=}"
+    case "$val" in
+      \"*\") val="${val#\"}"; val="${val%\"}";;
+      \'*\') val="${val#\'}"; val="${val%\'}";;
+      *)     val="${val%"${val##*[![:space:]]}"}";;
+    esac
+    found=1                                     # last one wins, like a shell
+  done < "$file"
+  [ "$found" -eq 1 ] && printf '%s' "$val"
+  return 0
 }
 
-cmd_deploy() {
-  local DO_BUILD=1
-  [ "${1:-}" = "--no-build" ] && DO_BUILD=0
-  cd "$ROOT"
-  git rev-parse --is-inside-work-tree >/dev/null 2>&1 || die "$ROOT is not a git clone."
-  local before after
-  before="$(git rev-parse --short HEAD)"
-  log "Syncing $ROOT to origin/$BRANCH"
-  git fetch --quiet origin "$BRANCH"
-  git reset --hard --quiet "origin/$BRANCH"
-  after="$(git rev-parse --short HEAD)"
-  if [ "$before" = "$after" ]; then log "already current ($after)"
-  else log "$before -> $after"; git --no-pager log --oneline "$before..$after"; fi
-
-  # npm ci, not npm install: the lockfile is the deployed dependency set, and
-  # a deploy that silently resolves different versions than CI tested is the
-  # bug you find at 2am.
-  if [ -f package-lock.json ]; then log "npm ci"; npm ci
-  elif [ -f package.json ]; then warn "no package-lock.json — falling back to npm install"; npm install; fi
-
-  if [ "$DO_BUILD" -eq 1 ] && [ -f package.json ] && npm run 2>/dev/null | grep -qE '^  build'; then
-    log "npm run build"; npm run build
+env_file_seed() {  # $1=file $2=KEY $3=default — write only if absent or empty
+  if [ -z "$(env_file_get "$1" "$2")" ]; then
+    if [ -s "$1" ] && [ -n "$(tail -c1 "$1")" ]; then printf '\n' >> "$1"; fi
+    printf '%s=%s\n' "$2" "$3" >> "$1"
+    log "$1: seeded $2=$3"
   fi
-
-  log "pm2 restart $APP"
-  pm2 restart "$APP" --update-env
-  pm2 save
-  sleep 2
-  probe
 }
 
-cmd_restart() { log "pm2 restart $APP"; pm2 restart "$APP" --update-env; sleep 2; probe; }
-cmd_logs()    { pm2 logs "$APP" "$@"; }
+ensure_env() {
+  if [ "$ENV_FILE" = "$ROOT/.env" ]; then
+    git -C "$ROOT" check-ignore -q .env \
+      || die ".env is not gitignored in $ROOT — refusing to write runtime config into a tracked path."
+  fi
+  [ -e "$ENV_FILE" ] || : > "$ENV_FILE"
+  chmod 600 "$ENV_FILE"
+  env_file_seed "$ENV_FILE" PORT "$PORT"
+  env_file_seed "$ENV_FILE" HOST "127.0.0.1"
+  env_file_seed "$ENV_FILE" INCOMPETECH_DB "$DB_DEFAULT"
+  chmod 600 "$ENV_FILE"
+}
 
-cmd_status() {
-  cd "$ROOT"
-  printf 'checkout:  %s  %s\n' "$(git rev-parse --short HEAD)" "$(git log -1 --format=%s)"
-  printf 'pm2:       '
-  pm2 jlist 2>/dev/null \
+db_path() {
+  path="$(env_file_get "$ENV_FILE" INCOMPETECH_DB)"
+  [ -n "$path" ] || path="$DB_DEFAULT"
+  printf '%s' "$path"
+}
+
+# ---------------------------------------------------------------------------
+# pm2
+# ---------------------------------------------------------------------------
+pm2_state() {
+  jl="$(pm2 jlist 2>/dev/null || true)"     # no pm2 / daemon down -> '' -> "not registered"
+  printf '%s' "$jl" \
     | python3 -c "import json,sys
 try: procs=json.load(sys.stdin)
 except Exception: procs=[]
@@ -105,20 +170,250 @@ e=p[0].get('pm2_env',{})
 print('%s  mode=%s  restarts=%s  uptime-since=%s' % (
   e.get('status'), e.get('exec_mode'), e.get('restart_time'), e.get('pm_uptime')))" 2>/dev/null \
     || printf 'unknown (pm2 not readable)\n'
+}
+
+save_if_online() {
+  # pm2 save overwrites the dump with whatever is running right now, so a save
+  # while this app is down persists a dump that omits it and the next reboot
+  # comes back short. Save only when it is online.
+  case "$(pm2_state)" in
+    online*) pm2 save;;
+    *) warn "$APP is not online — skipping pm2 save so the dump keeps its last good state";;
+  esac
+}
+
+# ---------------------------------------------------------------------------
+# Probes
+# ---------------------------------------------------------------------------
+probe() {
+  # Local first, then public: a healthy app behind a broken vhost and a dead
+  # app behind a fine vhost look identical from the outside, and telling them
+  # apart is most of the diagnosis. /api/health answers 200 with "built":false
+  # before the first build, which is a state to report rather than an outage.
+  lbody="$(curl -s --max-time 10 "http://127.0.0.1:$PORT$HEALTH" || true)"
+  lcode="$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "http://127.0.0.1:$PORT$HEALTH" || true)"
+  pcode="$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "https://$FQDN$HEALTH" || true)"
+  printf 'local:     http://127.0.0.1:%s%s  ->  HTTP %s  %s\n' "$PORT" "$HEALTH" "${lcode:-unreachable}" "${lbody:-}"
+  printf 'public:    https://%s%s  ->  HTTP %s\n' "$FQDN" "$HEALTH" "${pcode:-unreachable}"
+  case "${lbody:-}" in
+    *'"built":false'*) warn "the app is up but has no catalogue database — run: incompetech build";;
+  esac
+}
+
+upstream_family() {
+  # Which loopback family answers on the port, and which one the vhost proxies
+  # to. A process bound to [::1] behind a vhost saying `localhost` works by
+  # accident, and `127.0.0.1` breaks it. This app binds HOST=127.0.0.1.
+  v4=no; v6=no; target=""
+  curl -s -o /dev/null --max-time 3 "http://127.0.0.1:$PORT$HEALTH" && v4=yes
+  curl -s -o /dev/null --max-time 3 "http://[::1]:$PORT$HEALTH" && v6=yes
+  if vhost="$(vhost_path)"; then
+    target="$(grep -hoE '^[[:space:]]*proxy_pass[[:space:]]+[^;]+' "$vhost" | head -1 | awk '{print $2}')"
+  fi
+  printf '127.0.0.1:%s=%s  [::1]:%s=%s  vhost proxy_pass -> %s\n' \
+    "$PORT" "$v4" "$PORT" "$v6" "${target:-none}"
+  case "$target" in
+    *localhost*) warn "vhost proxies to 'localhost' — pin it to 127.0.0.1:$PORT (family is otherwise resolver-dependent)";;
+  esac
+}
+
+# ---------------------------------------------------------------------------
+# nginx vhost. A plain proxy — nothing to keep in sync inside it. This app has
+# no long-lived responses, so there is no SSE block and no vhost surgery: what
+# provision-site writes is correct as written.
+# ---------------------------------------------------------------------------
+vhost_path() {  # -> path on stdout, exit 1 if none
+  if [ -e "$NGINX_AVAIL/$FQDN" ]; then readlink -f "$NGINX_AVAIL/$FQDN"; return 0; fi
+  for link in "$NGINX_ENABLED"/*; do
+    [ -e "$link" ] || continue
+    if grep -qE "^[[:space:]]*server_name[^;]*[[:space:]]$FQDN([[:space:];]|$)" "$link"; then
+      readlink -f "$link"; return 0
+    fi
+  done
+  return 1
+}
+
+install_fallback_vhost() {
+  src="$ROOT/deploy/nginx-incompetech.conf"; conf="$NGINX_AVAIL/$FQDN"
+  [ -f "$src" ] || die "$src missing — cannot install the fallback vhost."
+  need_root
+  log "provision-site not on PATH — installing HTTP-only vhost $conf from deploy/nginx-incompetech.conf"
+  sed -e "s/incompetech\.lab980\.com/$FQDN/g" -e "s/127\.0\.0\.1:8072/127.0.0.1:$PORT/g" "$src" > "$conf"
+  ln -sf "$conf" "$NGINX_ENABLED/$FQDN"
+  if ! nginx -t; then rm -f "$conf" "$NGINX_ENABLED/$FQDN"; die "nginx -t rejected the fallback vhost; removed it."; fi
+  systemctl reload nginx
+  warn "HTTP only. Point DNS at this box, then:  certbot --nginx -d $FQDN --redirect"
+  warn "and, from the lab980 repo:  fix-security-headers --fix   (the fallback vhost has no headers include)"
+}
+
+cmd_setup() {
+  dry=""
+  [ "${1:-}" = "--dry-run" ] && dry="--dry-run"
+  cd "$ROOT"
+  if vhost_path >/dev/null 2>&1; then
+    log "vhost for $FQDN exists: $(vhost_path)"
+  elif [ "$dry" = "--dry-run" ]; then
+    if command -v provision-site >/dev/null 2>&1; then
+      log "dry run: would run  provision-site $STUB $REPO --port $PORT --dir $ROOT  (DNS + vhost + TLS)"
+    else
+      log "dry run: provision-site not on PATH; would install deploy/nginx-incompetech.conf as $NGINX_AVAIL/$FQDN (HTTP only)"
+    fi
+  elif command -v provision-site >/dev/null 2>&1; then
+    need_root
+    # --port is NOT optional: without it provision-site allocates the next free
+    # port from 8060 and proxies to that, while .env and this script use 8072 —
+    # nginx would then proxy to a port nothing is listening on. --dir keeps it
+    # on this checkout, which it detects as an existing clone and leaves alone.
+    log "running provision-site $STUB $REPO --port $PORT --dir $ROOT"
+    provision-site "$STUB" "$REPO" --port "$PORT" --dir "$ROOT"
+  else
+    install_fallback_vhost
+  fi
+  if systemctl is-enabled pm2-root >/dev/null 2>&1; then
+    log "pm2-root boot hook: enabled"
+  else
+    warn "pm2-root is not enabled — pm2 save alone does not survive a reboot. Once per droplet:"
+    warn "  pm2 startup systemd -u root --hp /root   (then run the line it prints)"
+  fi
+}
+
+cmd_build() {
+  cd "$ROOT"
+  [ -x "$PY" ] || die "no $PY — run: incompetech deploy"
+  ensure_env
+  DB="$(db_path)"
+  INCOMPETECH_DB="$DB"; export INCOMPETECH_DB
+  log "building $DB from incompetech.com (two requests, no key)"
+  # The build writes beside the target and renames it into place, so the
+  # running app is never handed a half-written database and nothing has to be
+  # stopped first. Drift in the genre/collection tables is printed to stderr.
+  "$PY" -m incompetech build "$@"
+}
+
+cmd_deploy() {
+  DO_INSTALL=1; REBUILD=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --no-install) DO_INSTALL=0;;
+      --rebuild)    REBUILD=1;;
+      *) die "usage: incompetech deploy [--no-install] [--rebuild]";;
+    esac
+    shift
+  done
+  need_root
+  command -v pm2 >/dev/null 2>&1 || die "pm2 not found on PATH."
+  cd "$ROOT"
+  git rev-parse --is-inside-work-tree >/dev/null 2>&1 || die "$ROOT is not a git clone."
+  before="$(git rev-parse --short HEAD)"
+  log "Syncing $ROOT to origin/$BRANCH"
+  git fetch --quiet origin "$BRANCH"
+  git reset --hard --quiet "origin/$BRANCH"
+  after="$(git rev-parse --short HEAD)"
+  if [ "$before" = "$after" ]; then log "already current ($after)"
+  else log "$before -> $after"; git --no-pager log --oneline "$before..$after"; fi
+
+  if [ "$DO_INSTALL" -eq 1 ]; then
+    # requirements.txt is deliberately ranged, not pinned (see its header), so
+    # this can resolve newer versions than the last deploy — there is no
+    # lockfile to hold it. The venv survives the hard reset (.venv/ is
+    # gitignored) and keeps what it has unless a range moved.
+    if [ ! -x "$PY" ]; then log "creating .venv"; python3 -m venv .venv; fi
+    log "pip install -r requirements.txt"
+    "$PY" -m pip install --quiet -r requirements.txt
+  fi
+  mkdir -p data
+  chmod +x run.sh 2>/dev/null || true
+  ensure_env
+
+  if ! vhost_path >/dev/null 2>&1; then
+    log "no vhost for $FQDN yet — running incompetech setup first"
+    if ! cmd_setup; then
+      warn "setup did not complete; deploying the app anyway. Fix the cause and re-run: incompetech setup"
+    fi
+  fi
+
+  case "$(pm2_state)" in
+    "not registered")
+      log "pm2 start $ECOSYSTEM ($APP, first registration)"
+      pm2 start "$ECOSYSTEM" --only "$APP"
+      ;;
+    *)
+      log "pm2 restart $APP"
+      pm2 restart "$ECOSYSTEM" --only "$APP"
+      ;;
+  esac
+  sleep 2
+  save_if_online
+
+  # The database is derived and untracked, so a fresh box has none and a
+  # deploy on an existing one must not spend two requests and a rebuild on
+  # every push. Build when there is nothing to serve; refresh only when asked.
+  DB="$(db_path)"
+  if [ "$REBUILD" -eq 1 ]; then
+    log "--rebuild: refreshing the catalogue"
+    cmd_build
+  elif [ ! -s "$DB" ]; then
+    log "no database at $DB — building it"
+    cmd_build
+  else
+    log "database present ($DB) — leaving it alone (incompetech deploy --rebuild to refresh)"
+  fi
+
   probe
-  local pem="/etc/letsencrypt/live/$FQDN/cert.pem"
+  log "deployed: $(git rev-parse --short HEAD)  $(git log -1 --format=%s)"
+}
+
+cmd_restart() {
+  need_root; cd "$ROOT"
+  log "pm2 restart $APP"
+  pm2 restart "$ECOSYSTEM" --only "$APP"
+  sleep 2
+  probe
+}
+
+cmd_logs() { pm2 logs "$APP" "$@"; }
+
+cmd_status() {
+  cd "$ROOT"
+  printf 'checkout:  %s  %s\n' "$(git rev-parse --short HEAD)" "$(git log -1 --format=%s)"
+  printf 'dir:       %s\n' "$ROOT"
+  if [ -x "$PY" ]; then printf 'python:    %s (%s)\n' "$("$PY" --version 2>&1)" "$PY"
+  else printf 'python:    no .venv — run: incompetech deploy\n'; fi
+  printf 'pm2:       %s\n' "$(pm2_state)"
+  if [ -e "$ENV_FILE" ]; then
+    printf 'env:       %s  PORT=%s  HOST=%s\n' "$ENV_FILE" \
+      "$(env_file_get "$ENV_FILE" PORT)" "$(env_file_get "$ENV_FILE" HOST)"
+  else
+    printf 'env:       %s missing — run: incompetech deploy\n' "$ENV_FILE"
+  fi
+  DB="$(db_path)"
+  if [ -s "$DB" ]; then
+    printf 'database:  %s  %s  (%s)\n' "$DB" \
+      "$(du -h "$DB" 2>/dev/null | cut -f1)" \
+      "$(date -r "$DB" '+%Y-%m-%d %H:%M' 2>/dev/null || echo '?')"
+  else
+    printf 'database:  %s  ABSENT — run: incompetech build\n' "$DB"
+  fi
+  printf 'upstream:  %s\n' "$(upstream_family 2>&1)"
+  if vhost="$(vhost_path)"; then printf 'vhost:     %s\n' "$vhost"
+  else printf 'vhost:     none for %s — run: incompetech setup\n' "$FQDN"; fi
+  probe
+  pem="/etc/letsencrypt/live/$FQDN/cert.pem"
   if [ -r "$pem" ]; then
-    local end days
     end="$(openssl x509 -enddate -noout -in "$pem" | cut -d= -f2)"
     days=$(( ($(date -d "$end" +%s) - $(date +%s)) / 86400 ))
     printf 'cert:      %s days remaining (expires %s)\n' "$days" "$end"
-  else
+  elif [ "$(id -u)" -ne 0 ]; then
     printf 'cert:      (run as root to read expiry)\n'
+  else
+    printf 'cert:      none at %s — run: incompetech setup\n' "$pem"
   fi
 }
 
 case "${1:-}" in
   deploy)  shift; cmd_deploy "$@";;
+  setup)   shift; cmd_setup "$@";;
+  build)   shift; cmd_build "$@";;
   restart) shift; cmd_restart "$@";;
   logs)    shift; cmd_logs "$@";;
   status)  shift; cmd_status "$@";;
