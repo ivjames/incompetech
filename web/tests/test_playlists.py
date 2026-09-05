@@ -94,6 +94,49 @@ def test_the_page_batches_by_no_more_than_the_server_accepts():
     assert int(batch.group(1)) <= MAX_FILENAMES
 
 
+def test_the_exports_are_disabled_before_the_panel_yields():
+    """The window between asking the catalogue and hearing back.
+
+    `rows` still holds the previous playlist's pieces across that await, and
+    an export takes its content from `rows` and its *name* from the active
+    playlist. Left live, one click there writes a file named after the new
+    playlist carrying the old one's credit lines — a wrong attribution,
+    produced by the feature whose whole job is getting attribution right.
+    """
+    load = JS[JS.index("async function load()"):JS.index("function itemRow(")]
+    yields = load.index("await P.resolve(")
+    guarded = load[:yields]
+    assert "setExportsEnabled(false)" in guarded, \
+        "the exports stay live over the await, pointing at the previous rows"
+    assert "rows = [];" in guarded, "and `rows` is still the previous playlist's"
+
+
+def test_a_refusal_the_fetch_helper_swallows_is_still_reported():
+    """app.js reports a throw; a 503 or a 400 comes back parsed.
+
+    `resolve` therefore hands back a reason rather than a bare null, and the
+    panel puts it on the line it keeps for exactly this — otherwise the reader
+    gets an empty table with no rows, no empty-state and nothing said.
+    """
+    resolve = JS[JS.index("async function resolve("):JS.index("let attribution")]
+    assert "return { error:" in resolve, "resolve has no way to say what went wrong"
+    assert "return null" not in resolve
+    load = JS[JS.index("async function load()"):JS.index("function itemRow(")]
+    assert "out.error" in load and "showTrouble()" in load
+
+
+def test_the_store_is_read_before_it_is_asked_whether_it_works():
+    """`trouble()` only has an answer once a read has been attempted.
+
+    Asked first, the very first render — the one where someone is about to
+    start collecting into a browser that will keep none of it — is the one
+    render that says nothing.
+    """
+    refresh = JS[JS.index("function refresh()"):JS.index("/* Re-read the active")]
+    assert refresh.index("P.all()") < refresh.index("showTrouble()"), \
+        "the panel asks whether storage works before it has touched storage"
+
+
 def test_a_name_someone_typed_is_never_written_as_markup():
     """Playlist names are free text and go straight into the page."""
     for match in re.finditer(r"\.innerHTML\s*=\s*(.+)", JS):

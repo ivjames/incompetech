@@ -38,20 +38,21 @@ about this site rather than about the platform. For the box itself, read the
   `health-check --site incompetech` knows the site and probes its vhost.
 - **There are no platform keys and no secrets.** No API key, no credential, no
   write path: every route is a GET, and the one outbound request in the repo
-  is the build fetching a public JSON document. **Playlists did not change
-  this, on purpose** — they are the first thing anyone has wanted the site to
-  *keep*, and the two ways to keep them on the server were to let the whole
-  internet delete each other's, or to grow the login this app has so far not
-  needed. So they are held in the browser's `localStorage` and the server
-  stayed read-only. That is a trade, not a free win: `bin/incompetech` cannot
-  see a playlist, so it is the one feature the CLI and the page do not share,
-  and a playlist leaves its browser only through Export/Import. So `bin/incompetech` carries
+  is the build fetching a public JSON document. So `bin/incompetech` carries
   none of dnd-sim's key machinery — no key-store adoption, no write token
   (and since 2026-09-05 there is no box-level key store to adopt from anyway:
   an app's `.env` is the only copy of any key it uses). `.env` holds three
   settings (`PORT`, `HOST`, `INCOMPETECH_DB`), none of them sensitive. If this
   app ever does need a secret, that is a decision to record here first — and
   `.env` is where it would live, never the ecosystem file or pm2's argv.
+  **Playlists did not change any of this, on purpose** — they are the first
+  thing anyone has wanted the site to *keep*, and the two ways to keep them on
+  the server were to let the whole internet delete each other's, or to grow
+  the login this app has so far not needed. So they are held in the browser's
+  `localStorage` and the server stayed read-only. That is a trade, not a free
+  win: `bin/incompetech` cannot see a playlist, so it is the one feature the
+  CLI and the page do not share, and a playlist leaves its browser only
+  through Export/Import.
 - **pm2 is launched scrubbed anyway.** Every pm2 call in `bin/incompetech`
   goes through `pm2_clean` — `env -i` plus PATH, HOME, PM2_HOME and TERM when
   set, `LANG`, and `PORT` — and never `--update-env`. That is the lab980
@@ -259,9 +260,12 @@ in the process. What each step does and how to confirm what is live:
   and the page's resolve goes through the same `search` as everything else.
   Exact and not a LIKE on purpose: a name that matched loosely would put the
   wrong piece's attribution under someone's video. The API caps it at
-  `MAX_FILENAMES` (200) and the page batches by 100, because past nginx's
+  `MAX_FILENAMES` (100) and the page batches by 50, because past nginx's
   request-line buffer the reply is a 414 of nginx's HTML that this app never
-  sees and the page cannot read; a test pins the two numbers together.
+  sees and the page cannot read; a test pins the two numbers together. Both
+  numbers are deliberately well under the 8 KB default: the vhost a
+  provisioned box runs is written by lab980's `provision-site`, so the bound
+  cannot lean on a proxy setting this repo does not control.
 - **localStorage throws — it does not return null** — in a browser set to
   block site data, so every access in `playlists.js` is inside a guard and the
   panel says why it cannot save rather than taking `boot` down with it over a

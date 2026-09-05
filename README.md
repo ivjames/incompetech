@@ -81,7 +81,7 @@ Read-only, no auth, JSON, `Cache-Control: no-store`.
 | route | what it gives |
 |---|---|
 | `GET /api/health` | `{"ok": true, "built": bool, "pieces": N, "built_at": ..., "fts": bool}`. **200 even with no database** — the app answers before the first build |
-| `GET /api/pieces` | the filters above as query params: `text`, repeated `filename` (exact, OR, at most 200 per request) and `feel` (AND) and `feel_any` (OR), `instrument`, `genre`, `collection`, `category`, `bpm_min`/`bpm_max`/`bpm_unknown`, `min_length`/`max_length`, `since`/`until`, `sort`, `desc`, `limit`/`offset`. Returns `{"total": N, "pieces": [...]}`, each piece with its resolved genre, collection and category, feels, instruments, `mp3_url`, `page_url` and `credit`. A filter that cannot mean anything is a **400 with the reason**, never a 500 |
+| `GET /api/pieces` | the filters above as query params: `text`, repeated `filename` (exact, OR, at most 100 per request) and `feel` (AND) and `feel_any` (OR), `instrument`, `genre`, `collection`, `category`, `bpm_min`/`bpm_max`/`bpm_unknown`, `min_length`/`max_length`, `since`/`until`, `sort`, `desc`, `limit`/`offset`. Returns `{"total": N, "pieces": [...]}`, each piece with its resolved genre, collection and category, feels, instruments, `mp3_url`, `page_url` and `credit`. A filter that cannot mean anything is a **400 with the reason**, never a 500 |
 | `GET /api/facets` | the feels (counts, and whether each is one of the catalogue's own 20 words), genres, collections grouped by category, instruments with counts — what the page builds its controls from |
 | `GET /api/meta` | source URLs, when it was fetched, the licence and the attribution |
 

@@ -243,13 +243,25 @@ const Playlists = (() => {
 
   /* --------------------------------------------------------- resolving */
 
-  /* How many names one request may carry. The server refuses more (its own
-     bound is nginx's request-line buffer), so a long playlist is asked for in
-     batches rather than in one request that comes back 414 from the proxy
-     with nothing readable in it. */
-  const BATCH = 100;
+  /* How many names one request may carry.
+   *
+   * The bound is not this app's, it is the proxy's request-line buffer, and
+   * the arithmetic is the whole reason for the number: a name averages a bit
+   * over twenty characters, most of its spaces become `%20`, and `filename=`
+   * and `&` add ten more — so fifty names is roughly two kilobytes, well
+   * inside nginx's default eight, with room for the outliers. The server
+   * refuses more than MAX_FILENAMES, but the page deliberately asks for less
+   * than it may: past the buffer the reply is nginx's own 414 HTML, which
+   * this app never sees and the page cannot read. */
+  const BATCH = 50;
 
   /* The playlist's items as current catalogue rows, in the playlist's order.
+   *
+   * Returns `{rows}` or `{error}` — never a bare null. The caller has to be
+   * able to *say* what went wrong: app.js's `getJSON` reports only a fetch or
+   * parse that threw, so a 503 (no database yet) or a 400 comes back here
+   * parsed, unreported, and looking like an ordinary answer. Handed back as
+   * an error it reaches the panel, which has a line to put it on.
    *
    * Anything the catalogue no longer has comes back with `missing: true` and
    * its stored title rather than being dropped: a piece silently vanishing
@@ -257,7 +269,7 @@ const Playlists = (() => {
    * statement instead of a visible problem.
    */
   async function resolve(pl, fetchJSON) {
-    if (!pl || !pl.items.length) return [];
+    if (!pl || !pl.items.length) return { rows: [] };
     const byName = new Map();
     for (let i = 0; i < pl.items.length; i += BATCH) {
       const batch = pl.items.slice(i, i + BATCH);
@@ -265,12 +277,13 @@ const Playlists = (() => {
       for (const it of batch) q.append('filename', it.filename);
       q.append('limit', String(batch.length));
       const doc_ = await fetchJSON('/api/pieces?' + q.toString());
-      if (!doc_ || doc_.error) return null;
+      if (!doc_) return { error: 'the server did not answer' };
+      if (doc_.error) return { error: doc_.error };
       for (const p of doc_.pieces || []) byName.set(p.filename, p);
     }
-    return pl.items.map((it) => byName.get(it.filename) ||
+    return { rows: pl.items.map((it) => byName.get(it.filename) ||
       { filename: it.filename, title: it.title, missing: true,
-        length_s: null, bpm: null, feels: [], instruments: [] });
+        length_s: null, bpm: null, feels: [], instruments: [] }) };
   }
 
   /* ---------------------------------------------------------- exporting */
@@ -411,16 +424,28 @@ window.Playlists = Playlists;
    * the next time anyone looks.
    */
   let seen = new Map();
+  let failure = '';         // why the last resolve could not answer
+  let shownFor = '';        // the playlist the table on screen belongs to
 
   /* ------------------------------------------------------------- render */
 
-  function refresh() {
-    const trouble = P.trouble();
-    $('pl_trouble').textContent = trouble;
-    $('pl_trouble').hidden = !trouble;
+  /* Two things can go wrong and both belong on one line: the browser refusing
+     to store anything, and the catalogue refusing to answer. */
+  function showTrouble() {
+    const msg = P.trouble() || failure;
+    $('pl_trouble').textContent = msg;
+    $('pl_trouble').hidden = !msg;
+  }
 
+  function refresh() {
+    // The lists first: `P.trouble()` only has an answer once the store has
+    // been read, and reading it is what discovers that it cannot be read. Ask
+    // the other way round and the very first render — the one where someone
+    // is about to start collecting into a browser that will not keep any of
+    // it — is the one render that says nothing.
     const lists = P.all();
     const cur = P.active();
+    showTrouble();
 
     const sel = $('pl_select');
     sel.innerHTML = '';
@@ -459,6 +484,9 @@ window.Playlists = Playlists;
     const body = $('pl_rows');
     if (!cur || !cur.items.length) {
       rows = [];
+      shownFor = cur ? cur.id : '';
+      failure = '';
+      showTrouble();
       body.innerHTML = '';
       $('pl_table').hidden = true;
       $('pl_empty').hidden = false;
@@ -469,15 +497,39 @@ window.Playlists = Playlists;
     $('pl_empty').hidden = true;
     const wanted = { items: cur.items.filter((i) => !seen.has(i.filename)) };
     if (wanted.items.length) {
-      const resolved = await P.resolve(wanted, getJSON);
+      // Before yielding: `rows` still holds whatever was resolved last, and
+      // an export reads `rows` for its content and the *active* playlist for
+      // its name. Left enabled across the await, one click in that window
+      // writes a file named after this playlist carrying the last one's
+      // credits — a wrong attribution, produced by the feature whose whole
+      // job is getting attribution right. So the exports go with the rows.
+      rows = [];
+      setExportsEnabled(false);
+      // Rows on screen from another playlist are cleared too; rows from this
+      // one are left up, because blanking the table for a round trip every
+      // time a piece is added would be worse than a moment of staleness.
+      if (shownFor !== cur.id) {
+        body.innerHTML = '';
+        $('pl_table').hidden = true;
+      }
+      const out = await P.resolve(wanted, getJSON);
       if (mine !== seq) return;             // a newer load has started
-      if (!resolved) {                      // getJSON already said why
-        setExportsEnabled(false);
+      if (out.error) {
+        // Not every refusal reaches app.js's error line — a 503 or a 400 comes
+        // back parsed rather than thrown — so the panel says it itself, rather
+        // than showing an empty table with no rows, no empty-state and no
+        // reason.
+        failure = 'could not read the playlist: ' + out.error;
+        showTrouble();
+        $('pl_empty').hidden = true;
         return;
       }
-      for (const r of resolved) seen.set(r.filename, r);
+      for (const r of out.rows) seen.set(r.filename, r);
     }
+    failure = '';
+    showTrouble();
     rows = cur.items.map((i) => seen.get(i.filename));
+    shownFor = cur.id;
     body.innerHTML = '';
     for (const r of rows) body.appendChild(itemRow(cur, r));
     $('pl_table').hidden = false;
