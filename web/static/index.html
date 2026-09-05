@@ -18,6 +18,11 @@
   </p>
 </header>
 
+<!-- Outside #app on purpose. #app stays hidden until /api/health has answered,
+     so an error rendered inside it would be invisible in exactly the case that
+     needs reporting: the server not answering at all. -->
+<p id="error" class="error" hidden></p>
+
 <!-- Shown instead of the filters when no database has been built yet. The app
      answers before the first build on purpose, so the page has to say so. -->
 <section id="nodb" hidden>
@@ -77,8 +82,6 @@
   </div>
 </form>
 
-<p id="error" class="error" hidden></p>
-
 <div class="results-head">
   <p id="count" aria-live="polite">…</p>
   <p id="playing" class="playing"></p>
@@ -112,7 +115,7 @@
        the credit has to be legible wherever the audio plays. It is in the
        markup rather than rendered by script so it is on the page even if the
        API never answers. -->
-  <p class="credit">Music by Kevin MacLeod (incompetech.com), licensed under
+  <p class="credit" id="credit-line">Music by Kevin MacLeod (incompetech.com), licensed under
     Creative Commons: By Attribution 4.0</p>
   <p class="meta">
     <a href="https://creativecommons.org/licenses/by/4.0/">CC BY 4.0</a> ·

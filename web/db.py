@@ -49,23 +49,28 @@ def open_db() -> sqlite3.Connection | None:
     return conn
 
 
+#: Health with nothing behind it. The database's path is deliberately NOT in
+#: here: /api/health is anonymous and unauthenticated, and where a file sits on
+#: someone's server is their business, not a spectator's. `bin/incompetech`
+#: resolves the path from `.env` itself and parses only the `built` flag out of
+#: this document, so nothing needed it.
+_EMPTY = {"built": False, "pieces": 0, "built_at": None, "fts": False}
+
+
 def stats() -> dict:
     """What `/api/health` says about the database, whether or not there is one."""
     conn = open_db()
     if conn is None:
-        return {"built": False, "pieces": 0, "built_at": None, "fts": False,
-                "db": str(db_path())}
+        return _EMPTY.copy()
     try:
         meta = CAT.meta(conn)
         pieces = conn.execute("SELECT count(*) FROM piece").fetchone()[0]
         return {"built": True, "pieces": pieces,
                 "built_at": meta.get("fetched_at"),
-                "fts": bool(meta.get("fts")) and CAT.have_fts5(conn),
-                "db": str(db_path())}
+                "fts": bool(meta.get("fts")) and CAT.have_fts5(conn)}
     except sqlite3.Error:
         # A file that is not a database, or one from a schema this code no
         # longer knows. Health stays 200 and says the truth: nothing usable.
-        return {"built": False, "pieces": 0, "built_at": None, "fts": False,
-                "db": str(db_path())}
+        return _EMPTY.copy()
     finally:
         conn.close()

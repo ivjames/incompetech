@@ -24,9 +24,14 @@ about this site rather than about the platform. For the box itself, read the
   fact about the box rather than about a file, so **confirm it there before the
   first `incompetech setup`**:
   `grep -rho 'proxy_pass http://127.0.0.1:[0-9]*' /etc/nginx/sites-enabled/ | sort -u`.
-  It lives in three places — `.env`, `ecosystem.config.js` and
-  `INCOMPETECH_PORT` in `bin/incompetech` — and changing it means changing all
-  three plus the vhost.
+  **Moving it on the box is `.env` and the vhost, and nothing else.** `run.sh`
+  sources `.env` after pm2 has applied `ecosystem.config.js`, so `.env`'s
+  `PORT` already wins, and `bin/incompetech` resolves the port the same way
+  (`INCOMPETECH_PORT`, then `.env`, then its default). The port in
+  `ecosystem.config.js` and the fallback in `bin/incompetech` are repo
+  defaults: change them in a commit, never on the droplet, because both files
+  are tracked and `deploy` hard-resets the checkout — an edit there is undone
+  silently on the next deploy.
 - **The site is registered in `lab980.com`** — `.claude/sites.json` and the
   prose site list both carry it (PR #53), as shape `app`, dir
   `/var/www/incompetech`, cli `bin/incompetech`. Its `port` is recorded as

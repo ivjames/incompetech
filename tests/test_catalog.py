@@ -18,6 +18,8 @@ import sqlite3
 
 import pytest
 
+from dataclasses import replace
+
 from incompetech import catalog as CAT
 from incompetech import incompetech as I
 from tests.fixtures import CATALOG, row
@@ -585,3 +587,49 @@ def test_the_facets_are_what_a_control_can_be_built_from(db):
     assert "Hard Electronic" in cats["Electronic and Rock"]
     assert sum(len(v) for v in cats.values()) == len(I.COLLECTIONS)
     assert "bpm" in f["sorts"]
+
+
+def test_counting_does_not_materialise_every_matching_row(db):
+    """`count` is a count, not the length of a list of whole rows.
+
+    Counting by materialising was the only unbounded query the API could
+    reach: every match came back with both `group_concat` subqueries run over
+    it so that its length could be taken and the rows dropped — and then the
+    page was fetched again.
+    """
+    seen: list[str] = []
+    db.set_trace_callback(seen.append)
+    try:
+        assert CAT.count(db, CAT.Filters(feels=("Dark",), limit=2)) == 2
+    finally:
+        db.set_trace_callback(None)
+    sql = " ".join(seen)
+    assert "count(*)" in sql
+    assert "group_concat" not in sql, "counting fetched the rows it was counting"
+    # ... and it still counts the same rows the page comes from.
+    for f in (CAT.Filters(), CAT.Filters(feels=("Dark",)),
+              CAT.Filters(text="dread"), CAT.Filters(genres=("Horror",)),
+              CAT.Filters(categories=("Electronic and Rock",)),
+              CAT.Filters(bpm_unknown=True)):
+        assert CAT.count(db, f) == len(CAT.search(db, replace(f, limit=0)))
+
+
+def test_the_build_is_flushed_before_it_is_renamed_into_place(tmp_path, monkeypatch):
+    """A rename can reach the disk before the blocks it names do.
+
+    The result of that is the one corruption this design can produce: a file
+    under the canonical name that opens and is not a database. So the contents
+    are fsynced, then the rename, then the directory that now names it.
+    """
+    path = tmp_path / "catalog.sqlite3"
+    order: list[str] = []
+    real_fsync, real_replace = os.fsync, os.replace
+
+    monkeypatch.setattr(CAT.os, "fsync", lambda fd: (order.append("fsync"), real_fsync(fd))[1])
+    monkeypatch.setattr(CAT.os, "replace",
+                        lambda a, b: (order.append("replace"), real_replace(a, b))[1])
+    CAT.build_file(path, CATALOG)
+
+    assert order == ["fsync", "replace", "fsync"], order
+    assert path.exists() and CAT.connect(path).execute(
+        "SELECT count(*) FROM piece").fetchone()[0] == len(CATALOG) - 1

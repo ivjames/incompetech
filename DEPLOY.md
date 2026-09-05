@@ -19,9 +19,17 @@ is the highest entry, 8070 is ffc's centeredge-mock upstream (prose-only in
 lab980's `CLAUDE.md`) and 8071 is dnd-sim. What no file can settle is whether
 something on the droplet is already listening on it, which is why the registry
 records this site's `port` as `null` with `"port"` in `unverified` rather than
-as fact. Check on the box; if it is taken, change it in `.env`,
-`ecosystem.config.js` and `INCOMPETECH_PORT` in `bin/incompetech` (and the
-vhost) together. Either way, **fill the confirmed port into lab980's
+as fact. Check on the box, and if 8072 is taken, move it there in **two
+places, both untracked**: `PORT` in `.env`, and the vhost's `proxy_pass`. That
+is enough — `run.sh` sources `.env` after pm2 has applied
+`ecosystem.config.js`, so `.env` wins, and `incompetech status` resolves the
+port the same way it resolves the database (`INCOMPETECH_PORT`, then `.env`,
+then its default), so its probes follow. Then `incompetech restart`.
+
+**Do not edit `ecosystem.config.js` or `bin/incompetech` on the droplet.** Both
+are tracked, and `deploy` hard-resets the checkout: the edit is destroyed on
+the next deploy without saying so. They carry defaults, and a default is
+changed by a commit. Either way, **fill the confirmed port into lab980's
 `.claude/sites.json`** once you know it — that is the entry's one remaining
 hole:
 
@@ -75,7 +83,7 @@ of them sensitive:
 
 | key | default | what it is |
 |---|---|---|
-| `PORT` | `8072` | listen port — must match the vhost's `proxy_pass` and `ecosystem.config.js` |
+| `PORT` | `8072` | listen port — must match the vhost's `proxy_pass`. Sourced after pm2's env block, so it overrides `ecosystem.config.js` rather than having to agree with it |
 | `HOST` | `127.0.0.1` | listen address. nginx is the only thing that should reach it; binding `0.0.0.0` would publish the app around the vhost |
 | `INCOMPETECH_DB` | `/var/www/incompetech/data/catalog.sqlite3` | the catalogue database. `data/` is gitignored, so it survives a deploy |
 

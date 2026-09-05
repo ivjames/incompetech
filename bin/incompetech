@@ -46,7 +46,7 @@ SELF="$(readlink -f "$0")"
 ROOT="$(cd "$(dirname "$SELF")/.." && pwd)"
 FQDN="${INCOMPETECH_FQDN:-incompetech.lab980.com}"
 BRANCH="${INCOMPETECH_BRANCH:-main}"
-PORT="${INCOMPETECH_PORT:-8072}"
+PORT_FALLBACK=8072              # resolved through port(); see there
 ENV_FILE="${INCOMPETECH_ENV_FILE:-$ROOT/.env}"
 REPO="ivjames/incompetech"
 STUB="incompetech"
@@ -143,10 +143,23 @@ ensure_env() {
   fi
   [ -e "$ENV_FILE" ] || : > "$ENV_FILE"
   chmod 600 "$ENV_FILE"
-  env_file_seed "$ENV_FILE" PORT "$PORT"
+  env_file_seed "$ENV_FILE" PORT "$PORT"     # $PORT is port(), resolved at dispatch
   env_file_seed "$ENV_FILE" HOST "127.0.0.1"
   env_file_seed "$ENV_FILE" INCOMPETECH_DB "$DB_DEFAULT"
   chmod 600 "$ENV_FILE"
+}
+
+port() {
+  # The port the app is actually on: an explicit INCOMPETECH_PORT wins, then
+  # .env, then the built-in default — the same .env-first resolution db_path
+  # uses below, and for the same reason. `ensure_env` seeds .env once and never
+  # overwrites it, so an operator who moved the port there is the authority on
+  # it; a probe that kept asking 8072 would report the site down while it
+  # answered perfectly one port over.
+  if [ -n "${INCOMPETECH_PORT:-}" ]; then printf '%s' "$INCOMPETECH_PORT"; return 0; fi
+  p="$(env_file_get "$ENV_FILE" PORT)"
+  [ -n "$p" ] || p="$PORT_FALLBACK"
+  printf '%s' "$p"
 }
 
 db_path() {
@@ -326,10 +339,12 @@ cmd_deploy() {
   ensure_env
 
   if ! vhost_path >/dev/null 2>&1; then
+    # No "deploy anyway" fallback: every failure inside cmd_setup goes through
+    # `die`, which exits this script, so a branch here that carried on was one
+    # that could never run. A deploy that cannot get a vhost stops, and says
+    # why, rather than starting an app nothing can reach.
     log "no vhost for $FQDN yet — running incompetech setup first"
-    if ! cmd_setup; then
-      warn "setup did not complete; deploying the app anyway. Fix the cause and re-run: incompetech setup"
-    fi
+    cmd_setup
   fi
 
   case "$(pm2_state)" in
@@ -410,6 +425,12 @@ cmd_status() {
   fi
 }
 
+# Sourced for tests (INCOMPETECH_SOURCE_ONLY=1): define the functions, then
+# stop before resolving anything or dispatching.
+if [ -z "${INCOMPETECH_SOURCE_ONLY:-}" ]; then
+
+PORT="$(port)"      # after env_file_get exists, before any command reads $PORT
+
 case "${1:-}" in
   deploy)  shift; cmd_deploy "$@";;
   setup)   shift; cmd_setup "$@";;
@@ -420,3 +441,5 @@ case "${1:-}" in
   -h|--help|help|"") usage;;
   *) die "unknown command: $1 (see --help)";;
 esac
+
+fi

@@ -37,6 +37,17 @@ bp = Blueprint("api", __name__)
 MAX_LIMIT = 500
 DEFAULT_LIMIT = 50
 
+#: Upper bounds on the numbers a caller may send. They are domain bounds, not
+#: machine ones — no piece is a day long and nothing is played at ten thousand
+#: beats per minute — but the reason they have to exist is machine: Python
+#: integers are unbounded and SQLite's are int64, so a `bpm_min` of twenty
+#: digits binds fine here and raises `OverflowError` down in the driver, which
+#: is not the `ValueError` this layer turns into a 400. Bounded up here, the
+#: caller gets told which parameter was wrong instead of a 500.
+MAX_BPM = 10_000
+MAX_OFFSET = 1_000_000
+MAX_LENGTH_S = 86_400
+
 NO_DB = ("no catalogue database yet — run `python -m incompetech build` "
          "(or `incompetech build` on the droplet)")
 
@@ -93,6 +104,12 @@ def facets():
         return jsonify({"error": NO_DB, "built": False}), 503
     try:
         return jsonify({"built": True, **CAT.facets(conn)})
+    except sqlite3.Error:
+        # The file is there and is not a usable database — a truncated build
+        # from an older design, or something else entirely under the name.
+        # `/api/health` already reports that as "not built"; this route has to
+        # agree with it rather than 500 while health says all is well.
+        return jsonify({"error": NO_DB, "built": False}), 503
     finally:
         conn.close()
 
@@ -108,6 +125,8 @@ def pieces():
         total = CAT.count(conn, filters)
     except ValueError as exc:
         return jsonify({"error": _as_param_names(str(exc))}), 400
+    except sqlite3.Error:
+        return jsonify({"error": NO_DB, "built": False}), 503   # see facets()
     finally:
         conn.close()
     return jsonify({
@@ -123,11 +142,26 @@ def pieces():
 #: --bpm-min". Over HTTP nobody typed a flag, so the message is respelled as
 #: the parameter the caller actually sent. One substitution, in the layer that
 #: knows the difference, rather than a second set of messages in the library.
+#: What a message quotes is the caller's own string, echoed back by `!r`, and
+#: rewriting inside it would report a value nobody sent: `since=--foo-bar` came
+#: back as "since 'foo_bar' is not a date". So the substitution runs on the
+#: prose between the quoted runs and never on the runs themselves.
 _CLI_FLAG = re.compile(r"--([a-z][a-z-]*)")
+_QUOTED = re.compile(r"'[^']*'")
 
 
 def _as_param_names(message: str) -> str:
-    return _CLI_FLAG.sub(lambda m: m.group(1).replace("-", "_"), message)
+    def flags(text: str) -> str:
+        return _CLI_FLAG.sub(lambda m: m.group(1).replace("-", "_"), text)
+
+    out: list[str] = []
+    last = 0
+    for quoted in _QUOTED.finditer(message):
+        out.append(flags(message[last:quoted.start()]))
+        out.append(quoted.group(0))         # the caller's value, verbatim
+        last = quoted.end()
+    out.append(flags(message[last:]))
+    return "".join(out)
 
 
 # ------------------------------------------------------------- query parsing
@@ -146,15 +180,15 @@ def _filters(args) -> CAT.Filters:
         genres=tuple(_list(args, "genre")),
         collections=tuple(_list(args, "collection")),
         categories=tuple(_list(args, "category")),
-        bpm_min=_int(args, "bpm_min"),
-        bpm_max=_int(args, "bpm_max"),
+        bpm_min=_int(args, "bpm_min", lo=0, hi=MAX_BPM),
+        bpm_max=_int(args, "bpm_max", lo=0, hi=MAX_BPM),
         bpm_unknown=_bool(args, "bpm_unknown"),
         length_min=_seconds(args, "min_length"),
         length_max=_seconds(args, "max_length"),
         uploaded_from=args.get("since", "").strip(),
         uploaded_to=args.get("until", "").strip(),
         limit=_int(args, "limit", default=DEFAULT_LIMIT, lo=1, hi=MAX_LIMIT),
-        offset=_int(args, "offset", default=0, lo=0),
+        offset=_int(args, "offset", default=0, lo=0, hi=MAX_OFFSET),
         sort=sort,
         desc=_bool(args, "desc"),
     )
@@ -193,9 +227,15 @@ def _seconds(args, name: str):
     if not raw:
         return None
     try:
-        return CAT.parse_duration(raw)
+        value = CAT.parse_duration(raw)
     except ValueError as exc:
         raise ValueError(f"{name}: {exc}") from None
+    # `parse_duration` multiplies out to an unbounded Python integer, so
+    # "1:99999999999999999999" parses happily and then cannot be bound. Same
+    # reason as MAX_BPM above.
+    if value > MAX_LENGTH_S:
+        raise ValueError(f"{name}={raw!r} is longer than {MAX_LENGTH_S} seconds")
+    return value
 
 
 # ------------------------------------------------------------------ shaping

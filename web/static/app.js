@@ -30,7 +30,15 @@ const state = {
 
 async function boot() {
   const health = await getJSON('/api/health');
-  if (!health || !health.built) {
+  if (!health) {
+    // Health did not answer, or did not answer JSON — a 502 from nginx, a
+    // dead upstream. getJSON has already written why into #error. Saying "no
+    // catalogue database yet, run incompetech build" here would send someone
+    // to rebuild a database on a server that is not running.
+    return;
+  }
+  if (!health.built) {
+    // Health answered, and said there is nothing to serve yet.
     $('nodb').hidden = false;
     return;
   }
@@ -204,7 +212,15 @@ async function search() {
   const seq = ++state.seq;
   const doc = await getJSON('/api/pieces?' + query().toString());
   if (!doc || seq !== state.seq) return;
-  if (doc.error) { showError(doc.error); render([]); return; }
+  if (doc.error) {
+    // The count and the pager describe the results, so they have to go with
+    // them: "1442 pieces match" over an empty table, with next → still live,
+    // is the old answer pretending to be this one.
+    state.total = 0;
+    showError(doc.error);
+    render([]);
+    return;
+  }
   showError('');
   state.total = doc.total;
   render(doc.pieces);

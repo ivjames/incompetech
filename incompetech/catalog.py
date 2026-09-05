@@ -41,7 +41,7 @@ import os
 import sqlite3
 from pathlib import Path
 from collections import Counter
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 
 from . import incompetech as I
 
@@ -374,7 +374,23 @@ def build_file(path, rows, *, fetched_at: str | None = None) -> Stats:
             stats = build(conn, rows, fetched_at=fetched_at)
         finally:
             conn.close()
+        # The rename is atomic against other processes; on its own it is not
+        # atomic against power loss. A rename can reach the disk before the
+        # blocks it names do, and what is then under the canonical name is a
+        # file that opens and is not a database — the one corruption this
+        # design can actually produce. So the contents are flushed first, and
+        # then the directory entry, which is what makes the rename durable.
+        fd = os.open(tmp, os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
         os.replace(tmp, path)       # atomic: same directory, same filesystem
+        dir_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
     except BaseException:
         # Anything at all — a malformed catalogue, a full disk, a Ctrl-C —
         # takes the half-built file with it. What is left is the database
@@ -472,8 +488,14 @@ def _like(value: str) -> str:
     return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
-def search(conn: sqlite3.Connection, f: Filters) -> list[dict]:
-    """Rows matching `f`, newest joins resolved, as plain dicts."""
+def _where(conn: sqlite3.Connection, f: Filters) -> tuple[list[str], list]:
+    """The WHERE clauses `f` asks for, and their arguments.
+
+    Split out so `search` and `count` ask the same question of the same rows:
+    a total that came from different SQL than the page under it would be a
+    number nobody could reproduce. Raises `ValueError` for the filters that
+    cannot mean anything — see `search`.
+    """
     where: list[str] = []
     args: list = []
 
@@ -574,6 +596,23 @@ def search(conn: sqlite3.Connection, f: Filters) -> list[dict]:
         where.append("p.uploaded <= ?")
         args.append(f.uploaded_to)
 
+    return where, args
+
+
+#: The joins every filter is written against. `genres`, `collections` and
+#: `categories` match on the resolved names, so counting has to join exactly
+#: as searching does.
+_JOINS = """
+        FROM piece p
+        LEFT JOIN genre g      ON g.genre_id = p.genre_id
+        LEFT JOIN collection c ON c.code = p.collection_code
+"""
+
+
+def search(conn: sqlite3.Connection, f: Filters) -> list[dict]:
+    """Rows matching `f`, newest joins resolved, as plain dicts."""
+    where, args = _where(conn, f)
+
     order = SORTS.get(f.sort, SORTS["title"])
     if f.desc:
         order = ", ".join(f"{part.strip()} DESC" for part in order.split(","))
@@ -596,9 +635,7 @@ def search(conn: sqlite3.Connection, f: Filters) -> list[dict]:
                    (SELECT ins.name AS name FROM piece_instrument pi
                       JOIN instrument ins ON ins.instrument_id = pi.instrument_id
                      WHERE pi.piece_id = p.piece_id ORDER BY pi.ord)) AS instruments
-        FROM piece p
-        LEFT JOIN genre g      ON g.genre_id = p.genre_id
-        LEFT JOIN collection c ON c.code = p.collection_code
+        {_JOINS}
         {"WHERE " + " AND ".join(where) if where else ""}
         ORDER BY {order}
         {_limit_clause(f)}
@@ -648,8 +685,19 @@ def _limit_clause(f: Filters) -> str:
 
 
 def count(conn: sqlite3.Connection, f: Filters) -> int:
-    """How many pieces match, ignoring `limit` and `offset`."""
-    return len(search(conn, replace(f, limit=0, offset=0)))
+    """How many pieces match, ignoring `limit` and `offset`.
+
+    A `count(*)`, not `len(search(...))`. Counting by materialising was the
+    only unbounded query the API could reach: every matching row came back
+    with both `group_concat` subqueries run over it, so that the length of the
+    list could be taken and the list thrown away — and then the page was
+    fetched again. The whole catalogue is small enough that nobody would
+    notice, which is exactly why it would have gone on being written that way.
+    """
+    where, args = _where(conn, f)
+    sql = f"""SELECT count(*) {_JOINS}
+              {"WHERE " + " AND ".join(where) if where else ""}"""
+    return conn.execute(sql, args).fetchone()[0]
 
 
 def facets(conn: sqlite3.Connection) -> dict:

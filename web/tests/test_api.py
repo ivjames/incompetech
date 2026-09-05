@@ -30,6 +30,9 @@ def test_health_counts_what_was_built(client):
     assert doc["pieces"] == len(CATALOG) - 1
     assert doc["built_at"] == "2026-09-05T00:00:00+00:00"
     assert isinstance(doc["fts"], bool)
+    # /api/health is anonymous. Where the file sits on the server is the
+    # operator's business; `bin/incompetech` reads the path from .env itself.
+    assert "db" not in doc
 
 
 def test_health_is_200_before_anything_has_been_built(empty_client):
@@ -41,16 +44,27 @@ def test_health_is_200_before_anything_has_been_built(empty_client):
     code, doc = get(empty_client, "/api/health")
     assert code == 200
     assert doc == {"ok": True, "built": False, "pieces": 0, "built_at": None,
-                   "fts": False, "db": doc["db"]}
+                   "fts": False}
 
 
 def test_a_file_that_is_not_a_database_is_reported_rather_than_raised(tmp_path):
+    """Present but unusable is the same answer as absent, on every route.
+
+    Health said "not built" while pieces and facets 500'd, so the page asked
+    what was wrong, was told nothing was, and then broke.
+    """
     from web.app import create_app
     path = tmp_path / "catalog.sqlite3"
     path.write_text("this is not a database", encoding="utf-8")
     client = create_app(db_path=str(path)).test_client()
+
     code, doc = get(client, "/api/health")
     assert code == 200 and doc["built"] is False and doc["pieces"] == 0
+    for route in ("/api/pieces", "/api/pieces?feel=Dark", "/api/facets"):
+        code, doc = get(client, route)
+        assert code == 503, f"{route} -> {code}"
+        assert doc["built"] is False and "incompetech build" in doc["error"]
+    assert get(client, "/api/meta")[0] == 200, "the licence is stated regardless"
 
 
 def test_the_page_is_served_and_carries_the_credit(client):
@@ -62,9 +76,19 @@ def test_the_page_is_served_and_carries_the_credit(client):
 
 
 def test_the_page_is_served_without_a_database_too(empty_client):
-    """... and says which command to run."""
-    body = empty_client.get("/").get_data(as_text=True)
-    assert "python -m incompetech build" in body or "incompetech build" in body
+    """... and the state it shows comes from the API, not from the file.
+
+    The page is one static document in every state, so asserting a string is
+    in it proves nothing about the no-database case. What differs is what the
+    API tells it: `built` false, and a 503 naming the command to run.
+    """
+    page = empty_client.get("/")
+    assert page.status_code == 200
+    assert "python -m incompetech build" in page.get_data(as_text=True)
+
+    assert get(empty_client, "/api/health")[1]["built"] is False
+    code, doc = get(empty_client, "/api/pieces")
+    assert code == 503 and "python -m incompetech build" in doc["error"]
 
 
 # ------------------------------------------------------------------- meta
@@ -164,9 +188,11 @@ def test_the_filters_the_website_does_not_have(client):
 def test_sorting_and_paging(client):
     every = titles(client, "limit=100")
     code, doc = get(client, "/api/pieces?limit=3")
+    assert code == 200
     assert [p["title"] for p in doc["pieces"]] == every[:3]
     assert (doc["total"], doc["limit"], doc["offset"]) == (len(every), 3, 0)
     code, doc = get(client, "/api/pieces?limit=3&offset=3")
+    assert code == 200
     assert [p["title"] for p in doc["pieces"]] == every[3:6]
     assert doc["total"] == len(every), "the total is the match count, not the page"
     assert titles(client, "sort=bpm&desc=1&limit=1") == ["The Britons"]
@@ -183,6 +209,14 @@ def test_a_filter_that_cannot_mean_anything_is_a_400_with_the_reason(client):
         ("limit=0", "below the minimum"),
         ("limit=99999", "above the maximum"),
         ("offset=-1", "below the minimum"),
+        # Bigger than int64. Python integers are unbounded and SQLite's are
+        # not, so unbounded here these bind fine and raise OverflowError down
+        # in the driver — which is not a ValueError, so it was a 500.
+        ("bpm_min=99999999999999999999", "above the maximum"),
+        ("bpm_max=9223372036854775808", "above the maximum"),
+        ("offset=99999999999999999999", "above the maximum"),
+        ("min_length=99999999999999999999", "longer than"),
+        ("max_length=1:99999999999999999999", "longer than"),
     ):
         code, doc = get(client, "/api/pieces?" + qs)
         assert code == 400, f"{qs} -> {code} {doc}"
@@ -191,6 +225,18 @@ def test_a_filter_that_cannot_mean_anything_is_a_400_with_the_reason(client):
         # The message names the query parameter the caller sent, not the CLI
         # flag the library phrased its refusal in.
         assert "--" not in doc["error"], doc["error"]
+
+
+def test_the_respelling_never_rewrites_the_callers_own_value(client):
+    """Only the flag is respelled — what the message quotes came from them.
+
+    `since=--foo-bar` was echoed back as "since 'foo_bar' is not a date": a
+    value nobody sent, in an error about the value they did.
+    """
+    code, doc = get(client, "/api/pieces?since=--foo-bar")
+    assert code == 400
+    assert "'--foo-bar'" in doc["error"], doc["error"]
+    assert doc["error"].startswith("since "), "the flag itself is still respelled"
 
 
 def test_pieces_say_so_rather_than_500_with_no_database(empty_client):
