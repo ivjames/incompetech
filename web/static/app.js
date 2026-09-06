@@ -1,5 +1,8 @@
 /* The filter page. No framework, no build step, no CDN — one file that reads
-   /api/facets to build its controls and /api/pieces to fill the table.
+   /api/facets to build its controls and /api/pieces to fill the table, plus
+   playlists.js, which owns the browser-local collections and the two hooks
+   this file calls into: `addCell` for a row's + button and `syncRows` after
+   every render.
  *
  * Two decisions worth knowing:
  *
@@ -50,6 +53,10 @@ async function boot() {
   if (!facets || facets.error) { showError(facets && facets.error); return; }
   buildControls(facets);
   wire();
+  // Playlists come up only here, after health said there is something to
+  // collect: a playlist over an unbuilt catalogue could be shown but not
+  // resolved, so every credit and every URL in it would be blank.
+  window.Playlists.boot(getJSON);
   search();
 }
 
@@ -232,6 +239,7 @@ function render(pieces) {
   const body = $('rows');
   body.innerHTML = '';
   for (const p of pieces) body.appendChild(rowFor(p));
+  window.Playlists.syncRows();
 
   $('count').textContent = state.total === 0
     ? 'nothing matches'
@@ -275,6 +283,7 @@ function rowFor(p) {
   }
 
   tr.appendChild(play);
+  tr.appendChild(window.Playlists.addCell(p));
   tr.appendChild(title);
   tr.appendChild(cell(hms(p.length_s), 'num'));
   tr.appendChild(cell(p.bpm == null ? '—' : String(p.bpm), 'num'));

@@ -48,6 +48,24 @@ MAX_BPM = 10_000
 MAX_OFFSET = 1_000_000
 MAX_LENGTH_S = 86_400
 
+#: How many `filename` parameters one request may carry. This one is not a
+#: domain bound at all — it is nginx's. A saved list resolves by naming every
+#: piece in it, and each name costs about forty bytes once `%20`-escaped and
+#: prefixed with `filename=`, so a long enough list overruns the proxy's
+#: request-line buffer and comes back 414 from nginx with nothing from this
+#: app in it: an error the page cannot read and the operator cannot find.
+#: Bounded here, an over-long list is a 400 that says so, and the caller's job
+#: is to ask in batches.
+#:
+#: The number has to leave the *documented* limit usable, which is why it is
+#: not larger: nginx's default request-line buffer is 8 KB, this app's vhost
+#: tunes it nowhere, and the vhost a provisioned box actually runs is written
+#: by lab980's `provision-site` rather than by anything in this repo — so the
+#: bound cannot lean on a proxy setting this repo does not control. A hundred
+#: names is about 4 KB, half the buffer, with room for the long ones; two
+#: hundred was not, and told callers a number that could still 414 on them.
+MAX_FILENAMES = 100
+
 NO_DB = ("no catalogue database yet — run `python -m incompetech build` "
          "(or `incompetech build` on the droplet)")
 
@@ -172,8 +190,13 @@ def _filters(args) -> CAT.Filters:
     sort = args.get("sort", "title")
     if sort not in CAT.SORTS:
         raise ValueError(f"sort={sort!r} is not one of: {', '.join(sorted(CAT.SORTS))}")
+    names = _list(args, "filename")
+    if len(names) > MAX_FILENAMES:
+        raise ValueError(f"filename was given {len(names)} times, more than the "
+                         f"maximum of {MAX_FILENAMES}; ask in batches")
     return CAT.Filters(
         text=args.get("text", "").strip(),
+        filenames=tuple(names),
         feels=tuple(_list(args, "feel")),
         feels_any=tuple(_list(args, "feel_any")),
         instruments=tuple(_list(args, "instrument")),

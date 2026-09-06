@@ -3,7 +3,8 @@
     build   fetch incompetech's pieces.json, normalise it, write the database
             (and check the lookup tables against the catalogue page)
     query   filter it: the axes the catalogue's own page does not offer —
-            tempo, duration, collection, category, upload date
+            tempo, duration, collection, category, upload date — and
+            --filename, which names pieces instead of describing them
     drift   re-read the catalogue page's lookup tables and report what has
             moved from the transcription in incompetech.py
 
@@ -47,6 +48,10 @@ def main(argv: list[str] | None = None) -> int:
     q = sub.add_parser("query", help="filter the catalogue")
     q.add_argument("--db", type=Path, default=None)
     q.add_argument("--text", "-t", default="", help="full-text over title + description")
+    q.add_argument("--filename", action="append", default=[],
+                   help="an exact filename, the catalogue's only unique field "
+                        "(repeatable — they OR). How a saved list of pieces is "
+                        "resolved back to rows with a current credit on them")
     q.add_argument("--feel", action="append", default=[],
                    help="require this feel (repeatable — they AND)")
     q.add_argument("--feel-any", action="append", default=[],
@@ -146,6 +151,7 @@ def _cmd_query(args) -> int:
     try:
         f = CAT.Filters(
             text=args.text,
+            filenames=tuple(args.filename),
             feels=tuple(args.feel),
             feels_any=tuple(args.feel_any),
             instruments=tuple(args.instrument),

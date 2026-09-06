@@ -133,6 +133,41 @@ td.title .desc { display: block; color: var(--muted); font-size: 0.82rem; max-wi
 .playbtn { width: 2rem; padding: 0.1rem 0; text-align: center; }
 .playbtn[aria-pressed="true"] { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
 
+/* ------------------------------------------------------------- playlists */
+
+.playlists {
+  margin: 1rem 0;
+  padding: 0.75rem 1rem;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+.plbar { margin-bottom: 0; align-items: end; }
+.plbar select { min-width: 12rem; }
+.plsum { color: var(--muted); font-size: 0.85rem; padding-bottom: 0.4rem; }
+.muted { color: var(--muted); }
+.small { font-size: 0.8rem; max-width: 70ch; }
+
+#pl_panel { margin-top: 0.9rem; border-top: 1px solid var(--line); padding-top: 0.75rem; }
+#pl_table { margin-bottom: 0.5rem; }
+#pl_table th.ord, #pl_table td.ord { width: 3.6rem; white-space: nowrap; }
+#pl_table tr.gone td.title { color: var(--error); }
+
+.mini {
+  width: 1.6rem; padding: 0 0.1rem; text-align: center;
+  font-size: 0.85rem; line-height: 1.4;
+}
+.mini + .mini { margin-left: 0.15rem; }
+
+.plexport { margin: 0.5rem 0 0; align-items: center; }
+#pl_note { font-size: 0.85rem; }
+
+th.add, td.add { width: 2.4rem; }
+.addbtn { width: 2rem; padding: 0.1rem 0; text-align: center; }
+.addbtn[aria-pressed="true"] {
+  background: var(--accent); color: var(--accent-ink); border-color: var(--accent);
+}
+
 .pager { display: flex; gap: 0.75rem; align-items: center; margin: 1rem 0; }
 .pager span { color: var(--muted); font-size: 0.85rem; }
 button:disabled { opacity: 0.4; cursor: default; }
@@ -144,6 +179,8 @@ footer { margin-top: 2rem; padding-top: 1rem; border-top: 1px solid var(--line);
 .sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); }
 
 @media (max-width: 640px) {
-  td.feels, th:nth-child(7), td:nth-child(7) { display: none; }
+  th.feels, td.feels { display: none; }
   select { max-width: 100%; }
+  .plbar { gap: 0.4rem; }
+  .plexport { gap: 0.4rem; }
 }

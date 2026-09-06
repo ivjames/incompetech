@@ -633,3 +633,41 @@ def test_the_build_is_flushed_before_it_is_renamed_into_place(tmp_path, monkeypa
     assert order == ["fsync", "replace", "fsync"], order
     assert path.exists() and CAT.connect(path).execute(
         "SELECT count(*) FROM piece").fetchone()[0] == len(CATALOG) - 1
+
+
+# ------------------------------------------------------- naming pieces
+
+def test_filenames_name_pieces_rather_than_describing_them(db):
+    """The one filter that is a key lookup, and what a saved list resolves by."""
+    assert titles(db, filenames=("Corncob.mp3",)) == ["Corncob"]
+    # Repeated, they OR — a saved list is a set of names, not a conjunction.
+    assert titles(db, filenames=("Corncob.mp3", "Dungeon Descent.mp3")) == [
+        "Corncob", "Dungeon Descent"]
+    assert titles(db, filenames=("nothing like this.mp3",)) == []
+    assert CAT.count(db, CAT.Filters(filenames=("Corncob.mp3",))) == 1
+
+
+def test_a_filename_is_exact_and_not_a_pattern(db):
+    """A prefix or a wildcard must not resolve to a piece nobody named.
+
+    The rows this reaches end up in a credit block, which is a licence
+    statement about a specific recording: a name that matched loosely would
+    put the wrong piece's attribution under someone's video.
+    """
+    assert titles(db, filenames=("Corncob",)) == [], "a prefix is not the name"
+    assert titles(db, filenames=("Corncob.mp3%",)) == []
+    assert titles(db, filenames=("%",)) == [], "LIKE's wildcard is not one here"
+    assert titles(db, filenames=("_orncob.mp3",)) == []
+    # The catalogue ships one filename already percent-encoded, and it is
+    # stored verbatim: the name that comes out of the API is the name that
+    # goes back in, with no decoding round trip in between.
+    assert titles(db, filenames=("Joey%27s Formal Waltz.mp3",)) == [
+        "Joey's Formal Waltz"]
+    assert titles(db, filenames=("Joey's Formal Waltz.mp3",)) == []
+
+
+def test_filenames_and_with_every_other_filter(db):
+    """Naming pieces narrows a query rather than replacing it."""
+    both = ("Corncob.mp3", "Dungeon Descent.mp3")
+    assert titles(db, filenames=both, feels=("Dark",)) == ["Dungeon Descent"]
+    assert titles(db, filenames=both, bpm_unknown=True) == ["Corncob"]

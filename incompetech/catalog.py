@@ -424,12 +424,19 @@ class Filters:
     """Everything the CLI can ask for. Empty fields ask for nothing.
 
     `feels` and `instruments` AND: three feels means a piece carrying all
-    three, which is the filter the whole exercise is for. `feels_any`,
-    `genres`, `collections` and `categories` OR within themselves and AND with
-    everything else.
+    three, which is the filter the whole exercise is for. `filenames`,
+    `feels_any`, `genres`, `collections` and `categories` OR within themselves
+    and AND with everything else.
     """
 
     text: str = ""
+    #: Exact `filename`s, ORed. The natural key, so this is the one filter
+    #: that names pieces rather than describing them: it is how a saved list
+    #: of pieces — a playlist held in a browser, a file of names piped in — is
+    #: resolved back to rows carrying a current `credit` and `mp3_url`. Exact
+    #: and not a LIKE, because a name that matched two pieces would silently
+    #: put the wrong one in someone's attribution block.
+    filenames: tuple[str, ...] = ()
     feels: tuple[str, ...] = ()
     feels_any: tuple[str, ...] = ()
     instruments: tuple[str, ...] = ()
@@ -498,6 +505,10 @@ def _where(conn: sqlite3.Connection, f: Filters) -> tuple[list[str], list]:
     """
     where: list[str] = []
     args: list = []
+
+    if f.filenames:
+        where.append(f"p.filename IN ({_marks(f.filenames)})")
+        args += list(f.filenames)
 
     if f.text:
         words = _words(f.text)
